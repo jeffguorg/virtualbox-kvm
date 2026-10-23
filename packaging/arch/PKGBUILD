@@ -1,0 +1,132 @@
+# Maintainer: jeffguorg <https://github.com/jeffguorg/virtualbox-kvm>
+#
+# VirtualBox 7.2.20 with:
+#   * the cyberus-technology KVM backend patch (driverless, /dev/kvm based)
+#   * the LinuxBridge network driver: first-class "LinuxBridge" attachment
+#     type connecting VMs to a Linux host bridge (e.g. vboxbr0) without any
+#     VirtualBox kernel modules
+#
+# Pinned to the verified patch set (cyberus 20260930 + our network patches)
+# on branch/tag vbox-7.2.20 of the packaging repository.
+
+pkgname=virtualbox-kvm-jeffguorg-patched
+pkgver=7.2.20
+pkgrel=1
+pkgdesc='VirtualBox with KVM backend and LinuxBridge host networking (driverless, no kernel modules)'
+arch=('x86_64')
+url='https://github.com/jeffguorg/virtualbox-kvm'
+license=('GPL-3.0-only')
+depends=(
+  'qt6-base' 'qt6-tools' 'qt6-scxml' 'libxkbcommon'
+  'libx11' 'libxext' 'libxcursor' 'libxinerama' 'libxrandr' 'libxmu'
+  'mesa' 'libglvnd' 'glslang'
+  'alsa-lib'
+  'curl' 'libpng' 'libvpx' 'opus' 'libxml2' 'libxslt' 'openssl' 'zlib'
+  'libcap' 'lvm2'
+)
+makedepends=(
+  'acpica' 'nasm' 'yasm' 'xorgproto'
+)
+conflicts=('virtualbox' 'virtualbox-kvm')
+provides=('virtualbox')
+install='virtualbox-kvm-jeffguorg-patched.install'
+source=(
+  "https://download.virtualbox.org/virtualbox/${pkgver}/VirtualBox-${pkgver}.tar.bz2"
+  '0001-NEM-Implement-KVM-backend.patch'
+  '0002-LinuxBridge-network-driver.patch'
+  '0003-LinuxBridge-setuid-fallback-and-ci-properties.patch'
+  '0004-LinuxBridge-attachment-type.patch'
+  '0005-LinuxBridge-ensure-bridge-helper-subcommand.patch'
+  '0006-LinuxBridge-ensure-bridge-on-vm-start.patch'
+  'makeself.sh'
+)
+sha256sums=(
+  '5c2138213b72f36c129b92c2c267f2a40e9c98513f4c86a584327f09f9be706d'
+  'cf6c8ec1d23b378e67939dff6affaa1a99587552100c2c5a147289fe3bb8e85a'
+  '58d789554aa118d6cd7f02306b95853b566d3bdc1c82edc2ca07144702b912d8'
+  'ac58949b483619bf8bcc2009b282d5db3bd2e5159df37404cb6bb9fa9c10732b'
+  'e9bfc6532e504a995c8d07c1942df5f579af04f8d637c9c567ce4e389d4a9b19'
+  '1928a75af66143c8b563a60f7cb0ecff0af62c4dd0698eb62db88d77af9e5122'
+  '7dcd326d16a8f3a71b98119409d52fdd24ca962f79d83d49b720344ef8fe64a1'
+  '2e73c14412b52124abfc832dd94c9178ff2567b1cce0fb502443d1d1965e2935'
+)
+
+prepare() {
+  cd "VirtualBox-${pkgver}"
+
+  # Driverless KVM backend, then the LinuxBridge network stack on top.
+  patch -Np1 < "${srcdir}/0001-NEM-Implement-KVM-backend.patch"
+  patch -Np1 < "${srcdir}/0002-LinuxBridge-network-driver.patch"
+  patch -Np1 < "${srcdir}/0003-LinuxBridge-setuid-fallback-and-ci-properties.patch"
+  patch -Np1 < "${srcdir}/0004-LinuxBridge-attachment-type.patch"
+  patch -Np1 < "${srcdir}/0005-LinuxBridge-ensure-bridge-helper-subcommand.patch"
+  patch -Np1 < "${srcdir}/0006-LinuxBridge-ensure-bridge-on-vm-start.patch"
+
+  # configure requires a 'makeself' tool (only used for the .run installer we
+  # never produce); the upstream release ships none in PATH, so provide one.
+  install -Dm755 "${srcdir}/makeself.sh" "${srcdir}/tools-bin/makeself"
+}
+
+build() {
+  cd "VirtualBox-${pkgver}"
+
+  export PATH="${srcdir}/tools-bin:${PATH}"
+
+  ./configure \
+    --with-kvm \
+    --disable-kmods \
+    --disable-docs \
+    --disable-hardening \
+    --disable-java \
+    --disable-sdl \
+    --disable-python
+
+  source ./env.sh
+  kmk
+}
+
+package() {
+  cd "VirtualBox-${pkgver}/out/linux.amd64/release/bin"
+
+  install -dm755 "${pkgdir}/usr/lib/virtualbox"
+  cp -a . "${pkgdir}/usr/lib/virtualbox/"
+
+  # Drop build-time/test/SDK artifacts.
+  rm -rf "${pkgdir}/usr/lib/virtualbox/"{testcase,sdk,src,obj}
+  rm -f "${pkgdir}/usr/lib/virtualbox/"*.debug
+  rm -f "${pkgdir}/usr/lib/virtualbox/bldRTLdrCheckImports"
+  rm -f "${pkgdir}/usr/lib/virtualbox/NemRawBench-1"
+  rm -f "${pkgdir}/usr/lib/virtualbox/VBoxDDR0.debug"
+
+  # The bridge helper must be setuid root (statically linked, restricted to
+  # vboxtap* interfaces, ownership root:root by package default).
+  chmod 4755 "${pkgdir}/usr/lib/virtualbox/VBoxNetBrCtl"
+
+  # Terminal entry points.
+  install -dm755 "${pkgdir}/usr/bin"
+  local _bin
+  for _bin in VirtualBox VirtualBoxVM VBoxManage VBoxHeadless; do
+    ln -sf "/usr/lib/virtualbox/${_bin}" "${pkgdir}/usr/bin/${_bin}"
+  done
+
+  # Host bridge helper (creates vboxbr0 + dnsmasq).
+  install -Dm755 "${srcdir}/VirtualBox-${pkgver}/src/VBox/Installer/linux/vboxbr0-setup.sh" \
+    "${pkgdir}/usr/bin/vboxbr0-setup"
+
+  # GUI: desktop entries and icons (generated/built into bin/).
+  install -Dm644 virtualbox.desktop \
+    "${pkgdir}/usr/share/applications/virtualbox.desktop"
+  install -Dm644 virtualboxvm.desktop \
+    "${pkgdir}/usr/share/applications/virtualboxvm.desktop"
+  local _size
+  for _icon in icons/*/virtualbox.png; do
+    [ -f "${_icon}" ] || continue
+    _size="$(basename "$(dirname "${_icon}")")"
+    install -Dm644 "${_icon}" \
+      "${pkgdir}/usr/share/icons/hicolor/${_size}/apps/virtualbox.png"
+  done
+
+  # License.
+  install -Dm644 "${srcdir}/VirtualBox-${pkgver}/COPYING" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/COPYING"
+}

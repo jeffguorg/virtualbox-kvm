@@ -39,6 +39,48 @@ virtualisation.virtualbox.host = {
 };
 ```
 
+
+### Arch Linux package (this fork)
+
+This fork adds a driverless network backend ("LinuxBridge": TAP + host bridge,
+no VirtualBox kernel modules) on top of the cyberus KVM patch, plus Arch
+packaging. Everything is pinned to the verified VirtualBox 7.2.20 tree on
+branch/tag `vbox-7.2.20`:
+
+```shell
+cd packaging/arch
+makepkg -s          # builds; installs makedepends via pacman
+sudo pacman -U virtualbox-kvm-jeffguorg-patched-7.2.20-1-x86_64.pkg.tar.zst
+```
+
+The package conflicts with/provides `virtualbox`, installs to `/usr/lib/virtualbox`
+with `/usr/bin` entry points, a desktop entry, and the setuid `VBoxNetBrCtl`
+helper. After install:
+
+```shell
+sudo vboxbr0-setup                                     # host bridge + dnsmasq
+VBoxManage modifyvm <vm> --nic1 linuxbridge --nic-property1 bridge=vboxbr0
+```
+
+Patches applied by the PKGBUILD, in order:
+`0001` cyberus KVM backend; `0002`–`0004` this fork's LinuxBridge driver,
+setuid tap creation, and first-class attachment type; `0005`–`0006` create-only
+host bridge setup at VM start (`VBoxNetBrCtl ensurebridge`, refused on CIDR
+overlap, `Ensure`/`Cidr` driver properties, `Ensure` defaults to true).
+`patches/` at the repository root is the single source of truth;
+`packaging/arch/*.patch` are symlinks into it (makepkg requires local
+sources next to the PKGBUILD).
+
+Maintaining / following upstream updates:
+
+1. `git fetch origin dev` (cyberus upstream). New patch releases land there
+   first; this fork pins the *verified* set and does not track `dev` directly.
+2. When bumping: copy the new `patches/0001-*.patch` from upstream, rebase
+   `0002`–`0006` onto the new VirtualBox tag if contexts drift (regenerate
+   with `git format-patch` from the VirtualBox working branch), update
+   `pkgver` and the tarball `sha256sums` in `packaging/arch/PKGBUILD`.
+3. Rebuild with `makepkg -s`, boot a VM to verify, then move the `vbox-7.2.20`
+   style branch/tag to the new verified commit.
 ![Enabling KVM backend for VirtualBox in NixOS](vbox-kvm-nixos.gif)
 
 ### Other distribution packages

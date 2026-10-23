@@ -1,0 +1,487 @@
+From 55d127da94c7151be51dee0ecf00a544ba6f50b7 Mon Sep 17 00:00:00 2001
+From: guochao <guochao@local>
+Date: Tue, 20 Oct 2026 22:32:27 +0800
+Subject: [PATCH 2/5] LinuxBridge: setuid tap creation fallback and
+ case-insensitive properties
+
+Two issues found in end-to-end testing with a real VM:
+
+1. TUNSETIFF to create a new TAP interface requires CAP_NET_ADMIN, which the
+   VM process does not have; it failed with EPERM ('Operation not permitted')
+   even though /dev/net/tun itself is world accessible.  The driver now falls
+   back to the setuid helper on EPERM/EACCES: VBoxNetBrCtl gained 'create
+   <ifname> <uid>' and 'destroy <ifname>' subcommands that create a persistent
+   TAP owned by the calling user (uid must equal the caller's real uid, and
+   the vboxtap* name restriction still applies).  The driver then attaches to
+   the existing interface by name - which works for the owner without any
+   capability - and immediately clears persistence again so the interface is
+   removed by the kernel when the VM releases the fd (clean exit or crash).
+   The helper now uses linux/if.h + linux/if_tun.h instead of glibc's
+   <net/if.h> (uapi conflict) with a local SIOCGIFINDEX-based ifIndexGet().
+
+2. Generic driver property names come from user input and CFGM compares keys
+   strictly case-sensitively, so 'bridge' was rejected while 'Bridge' passed.
+   The driver now validates and reads its properties case-insensitively
+   (value enumeration via pfnCFGMGetFirstValue/GetValueName + RTStrICmp),
+   keeping CFGM's own allocator in charge of the returned strings.
+
+Verified end-to-end: VM boots, vboxtap0 appears enslaved to vboxbr0 in
+forwarding state, dnsmasq leases 192.168.56.175 to the guest.
+---
+ src/VBox/Devices/Network/DrvLinuxBridge.cpp  | 183 +++++++++++++++++--
+ src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp | 132 ++++++++++++-
+ 2 files changed, 292 insertions(+), 23 deletions(-)
+
+diff --git a/src/VBox/Devices/Network/DrvLinuxBridge.cpp b/src/VBox/Devices/Network/DrvLinuxBridge.cpp
+index 77468139..541a4d82 100644
+--- a/src/VBox/Devices/Network/DrvLinuxBridge.cpp
++++ b/src/VBox/Devices/Network/DrvLinuxBridge.cpp
+@@ -7,7 +7,10 @@
+  *
+  *      1. It opens /dev/net/tun and creates a TAP interface named "vboxtapX"
+  *         (IFF_TAP|IFF_NO_PI, non-persistent, so it vanishes when the VM
+- *         releases the fd).
++ *         releases the fd).  Creating a new interface requires
++ *         CAP_NET_ADMIN, so when TUNSETIFF fails with EPERM the driver
++ *         asks the setuid helper to create a persistent interface owned
++ *         by the VM user first and then attaches to it by name.
+  *      2. It invokes the setuid-root helper "VBoxNetBrCtl" to enslave the TAP
+  *         interface to the configured host bridge and bring it up.  The
+  *         helper is restricted to "vboxtap*" names and talks rtnetlink
+@@ -215,6 +218,50 @@ static int drvLinuxBridgeRunCtl(PDRVLINUXBRIDGE pThis, const char *pszAction, co
+     return VINF_SUCCESS;
+ }
+ 
++/**
++ * Runs "VBoxNetBrCtl <action> <ifname> <extra-arg>" and waits for it.
++ *
++ * Same as drvLinuxBridgeRunCtl, but the fourth argument is not a bridge name
++ * (used for "create <ifname> <uid>").
++ *
++ * @returns VBox status code.
++ * @param   pThis       The instance data.
++ * @param   pszAction   "create".
++ * @param   pszExtra    The extra argument (uid string).
++ */
++static int drvLinuxBridgeRunCtl2(PDRVLINUXBRIDGE pThis, const char *pszAction, const char *pszExtra)
++{
++    char szCtl[RTPATH_MAX];
++    int rc = drvLinuxBridgeResolveCtlPath(pThis, szCtl, sizeof(szCtl));
++    if (RT_FAILURE(rc))
++        return rc;
++
++    const char *apszArgs[5];
++    apszArgs[0] = szCtl;
++    apszArgs[1] = pszAction;
++    apszArgs[2] = pThis->pszIfName;
++    apszArgs[3] = pszExtra;
++    apszArgs[4] = NULL;
++
++    RTPROCESS hProc;
++    rc = RTProcCreate(szCtl, apszArgs, RTENV_DEFAULT, 0 /*fFlags*/, &hProc);
++    if (RT_FAILURE(rc))
++        return rc;
++
++    RTPROCSTATUS Status;
++    rc = RTProcWait(hProc, 0 /*fFlags*/, &Status);
++    if (RT_FAILURE(rc))
++        return rc;
++    if (Status.enmReason != RTPROCEXITREASON_NORMAL || Status.iStatus != 0)
++    {
++        LogRel(("LinuxBridge#%d: '%s %s %s %s' failed: iStatus=%d enmReason=%d\n",
++                pThis->pDrvIns->iInstance, szCtl, pszAction, pThis->pszIfName,
++                pszExtra, Status.iStatus, Status.enmReason));
++        return VERR_ACCESS_DENIED;
++    }
++    return VINF_SUCCESS;
++}
++
+ 
+ /**
+  * Creates the TAP interface and attaches it to the host bridge.
+@@ -240,11 +287,48 @@ static int drvLinuxBridgeAttach(PDRVLINUXBRIDGE pThis)
+     if (ioctl(fd, TUNSETIFF, &IfReq) < 0)
+     {
+         int const iErr = errno;
+-        close(fd);
+-        return PDMDrvHlpVMSetError(pThis->pDrvIns, VERR_HOSTIF_INIT_FAILED, RT_SRC_POS,
+-                                   N_("TUNSETIFF failed for '%s': %s"), pThis->pszIfName, strerror(iErr));
++
++        /*
++         * Creating a new TAP interface requires CAP_NET_ADMIN, which the VM
++         * process does not have.  Fall back to the setuid helper creating a
++         * persistent interface owned by us, then attach to it by name
++         * (attach-by-name works for the owner without any capability).
++         */
++        if (iErr == EPERM || iErr == EACCES)
++        {
++            LogRel(("LinuxBridge#%d: TUNSETIFF for '%s' failed with %s, asking VBoxNetBrCtl to create it\n",
++                    pThis->pDrvIns->iInstance, pThis->pszIfName, strerror(iErr)));
++            char szUid[32];
++            RTStrPrintf(szUid, sizeof(szUid), "%d", (int)getuid());
++            int rc = drvLinuxBridgeRunCtl2(pThis, "create", szUid);
++            if (RT_SUCCESS(rc))
++                rc = ioctl(fd, TUNSETIFF, &IfReq) == 0 ? VINF_SUCCESS : -errno;
++            if (RT_FAILURE(rc))
++            {
++                close(fd);
++                return PDMDrvHlpVMSetError(pThis->pDrvIns, VERR_HOSTIF_INIT_FAILED, RT_SRC_POS,
++                                           N_("Failed to create TAP interface '%s' via VBoxNetBrCtl: %Rrc"),
++                                           pThis->pszIfName, rc);
++            }
++        }
++        else
++        {
++            close(fd);
++            return PDMDrvHlpVMSetError(pThis->pDrvIns, VERR_HOSTIF_INIT_FAILED, RT_SRC_POS,
++                                       N_("TUNSETIFF failed for '%s': %s"), pThis->pszIfName, strerror(iErr));
++        }
+     }
+ 
++    /*
++     * Make sure the interface is non-persistent: when the VM releases the
++     * fd (clean exit or crash), the kernel removes the TAP device and its
++     * bridge membership automatically.  For an interface we own this ioctl
++     * needs no capability.
++     */
++    if (ioctl(fd, TUNSETPERSIST, 0) < 0)
++        LogRel(("LinuxBridge#%d: warning: failed to clear persistence of '%s': %s\n",
++                pThis->pDrvIns->iInstance, pThis->pszIfName, strerror(errno)));
++
+     /* TUNSETIFF returns the name it actually bound; with a requested name
+      * present it is always exactly that name (created or attached), so no
+      * write-back is needed and pszIfName stays authoritative. */
+@@ -606,6 +690,43 @@ static DECLCALLBACK(void) drvLinuxBridgeDestruct(PPDMDRVINS pDrvIns)
+ }
+ 
+ 
++
++/**
++ * Finds the actual (stored) name of a config value, case-insensitively.
++ *
++ * Property names come from user supplied generic driver properties and may
++ * be in any case, while CFGM itself is strictly case-sensitive.
++ *
++ * @returns VINF_SUCCESS or VERR_CFGM_VALUE_NOT_FOUND.
++ */
++static int drvLinuxBridgeFindKeyCI(PCPDMDRVHLPR3 pHlp, PCFGMNODE pCfg, const char *pszKey,
++                                   char *pszActual, size_t cbActual)
++{
++    for (PCFGMLEAF pLeaf = pHlp->pfnCFGMGetFirstValue(pCfg); pLeaf; pLeaf = pHlp->pfnCFGMGetNextValue(pLeaf))
++    {
++        int rc = pHlp->pfnCFGMGetValueName(pLeaf, pszActual, cbActual);
++        if (RT_SUCCESS(rc) && RTStrICmp(pszActual, pszKey) == 0)
++            return VINF_SUCCESS;
++    }
++    return VERR_CFGM_VALUE_NOT_FOUND;
++}
++
++
++/**
++ * Queries a string value by case-insensitive key name (MM-heap allocated).
++ *
++ * @returns VBox status code (VERR_CFGM_VALUE_NOT_FOUND if absent).
++ */
++static int drvLinuxBridgeQueryStringCI(PPDMDRVINS pDrvIns, PCFGMNODE pCfg, const char *pszKey, char **ppsz)
++{
++    PCPDMDRVHLPR3 pHlp  = pDrvIns->pHlpR3;
++    char          szActual[64];
++    int rc = drvLinuxBridgeFindKeyCI(pHlp, pCfg, pszKey, szActual, sizeof(szActual));
++    if (RT_FAILURE(rc))
++        return rc;
++    return pHlp->pfnCFGMQueryStringAlloc(pCfg, szActual, ppsz);
++}
++
+ /**
+  * Construct a LinuxBridge network transport driver instance.
+  *
+@@ -654,12 +775,27 @@ static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE p
+     /*
+      * Validate the config.
+      */
+-    PDMDRV_VALIDATE_CONFIG_RETURN(pDrvIns, "Bridge"
+-                                           "|IfName"
+-                                           "|CtlPath"
+-                                           "|DetachOnTerminate"
+-                                           "|MAC",
+-                                           "");
++    /*
++     * Validate the config.  Property names come from user supplied generic
++     * driver properties, so accept them in any case (CFGM itself compares
++     * strictly case-sensitively).
++     */
++    static const char * const s_apszValidKeys[] = { "Bridge", "IfName", "CtlPath", "DetachOnTerminate", "MAC" };
++    for (PCFGMLEAF pLeaf = pHlp->pfnCFGMGetFirstValue(pCfg); pLeaf; pLeaf = pHlp->pfnCFGMGetNextValue(pLeaf))
++    {
++        char szName[64];
++        int rc2 = pHlp->pfnCFGMGetValueName(pLeaf, szName, sizeof(szName));
++        if (RT_FAILURE(rc2))
++            return PDMDRV_SET_ERROR(pDrvIns, rc2, N_("Configuration error: failed to enumerate config values"));
++        bool fFound = false;
++        for (size_t i = 0; i < RT_ELEMENTS(s_apszValidKeys) && !fFound; i++)
++            if (RTStrICmp(szName, s_apszValidKeys[i]) == 0)
++                fFound = true;
++        if (!fFound)
++            return PDMDRV_SET_ERROR(pDrvIns, VERR_CFGM_CONFIG_UNKNOWN_VALUE,
++                                    N_("Configuration error: unknown property; allowed: "
++                                       "Bridge, IfName, CtlPath, DetachOnTerminate"));
++    }
+ 
+     /*
+      * Check that no-one is attached to us.
+@@ -679,14 +815,21 @@ static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE p
+     /*
+      * Read the configuration.
+      */
+-    int rc = pHlp->pfnCFGMQueryStringAlloc(pCfg, "Bridge", &pThis->pszBridge);
+-    if (RT_FAILURE(rc))
++    int rc = drvLinuxBridgeQueryStringCI(pDrvIns, pCfg, "Bridge", &pThis->pszBridge);
++    if (rc == VERR_CFGM_VALUE_NOT_FOUND)
+         return PDMDRV_SET_ERROR(pDrvIns, rc,
+                                 N_("Configuration error: required property \"Bridge\" (host bridge name, e.g. vboxbr0) is missing"));
++    if (RT_FAILURE(rc))
++        return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"Bridge\""));
+ 
+     char szDefaultIfName[IFNAMSIZ];
+     RTStrPrintf(szDefaultIfName, sizeof(szDefaultIfName), "vboxtap%u", pDrvIns->iInstance);
+-    rc = pHlp->pfnCFGMQueryStringAllocDef(pCfg, "IfName", &pThis->pszIfName, szDefaultIfName);
++    /* Query by the actual stored key name (case-insensitive match), so that
++       the CFGM allocator stays in charge of the MM-heap string. */
++    char szIfNameKey[64];
++    if (drvLinuxBridgeFindKeyCI(pHlp, pCfg, "IfName", szIfNameKey, sizeof(szIfNameKey)) != VINF_SUCCESS)
++        strcpy(szIfNameKey, "IfName");
++    rc = pHlp->pfnCFGMQueryStringAllocDef(pCfg, szIfNameKey, &pThis->pszIfName, szDefaultIfName);
+     if (RT_FAILURE(rc))
+         return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"IfName\""));
+     if (RTStrNCmp(pThis->pszIfName, RT_STR_TUPLE("vboxtap")) != 0)
+@@ -696,7 +839,7 @@ static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE p
+         return PDMDRV_SET_ERROR(pDrvIns, VERR_INVALID_NAME,
+                                 N_("Configuration error: \"IfName\" is too long (IFNAMSIZ-1 max)"));
+ 
+-    rc = pHlp->pfnCFGMQueryStringAlloc(pCfg, "CtlPath", &pThis->pszCtlPath);
++    rc = drvLinuxBridgeQueryStringCI(pDrvIns, pCfg, "CtlPath", &pThis->pszCtlPath);
+     if (rc == VERR_CFGM_VALUE_NOT_FOUND)
+     {
+         pThis->pszCtlPath = NULL;
+@@ -705,11 +848,13 @@ static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE p
+     else if (RT_FAILURE(rc))
+         return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"CtlPath\""));
+ 
+-    rc = pHlp->pfnCFGMQueryBool(pCfg, "DetachOnTerminate", &pThis->fDetachOnTerminate);
+-    if (rc == VERR_CFGM_VALUE_NOT_FOUND)
+-        rc = VINF_SUCCESS;
+-    else if (RT_FAILURE(rc))
+-        return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"DetachOnTerminate\""));
++    char szDetachKey[64];
++    if (drvLinuxBridgeFindKeyCI(pHlp, pCfg, "DetachOnTerminate", szDetachKey, sizeof(szDetachKey)) == VINF_SUCCESS)
++    {
++        rc = pHlp->pfnCFGMQueryBool(pCfg, szDetachKey, &pThis->fDetachOnTerminate);
++        if (RT_FAILURE(rc))
++            return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"DetachOnTerminate\""));
++    }
+ 
+     /*
+      * Create the TAP device and attach it to the bridge.
+diff --git a/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp b/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+index 652fbb9a..e9225e2c 100644
+--- a/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
++++ b/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+@@ -44,9 +44,14 @@
+ #include <errno.h>
+ #include <unistd.h>
+ 
++#include <sys/ioctl.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
+-#include <net/if.h>
++#include <fcntl.h>
++/* linux/if.h instead of glibc's <net/if.h>: the latter clashes with the
++ * kernel uapi headers we need (linux/if_tun.h pulls linux/if.h). */
++#include <linux/if.h>
++#include <linux/if_tun.h>
+ #include <linux/netlink.h>
+ #include <linux/rtnetlink.h>
+ 
+@@ -72,6 +77,8 @@ static int usage(void)
+ {
+     fprintf(stderr, "Usage: VBoxNetBrCtl attach <vboxtapX> <bridge>\n");
+     fprintf(stderr, "     | VBoxNetBrCtl detach <vboxtapX>\n");
++    fprintf(stderr, "     | VBoxNetBrCtl create <vboxtapX> <uid>\n");
++    fprintf(stderr, "     | VBoxNetBrCtl destroy <vboxtapX>\n");
+     return EXIT_FAILURE;
+ }
+ 
+@@ -155,6 +162,8 @@ static int nlTalk(int fd, struct nlmsghdr *pNlh)
+ 
+ static int nlAddAttr(struct nlmsghdr *pNlh, size_t cbBuf, int iType, const void *pv, size_t cb)
+ {
++
++
+     size_t const cbAttr = RTA_LENGTH(cb);
+     if (NLMSG_ALIGN(pNlh->nlmsg_len) + RTA_ALIGN(cbAttr) > cbBuf)
+         return -EMSGSIZE;
+@@ -166,11 +175,75 @@ static int nlAddAttr(struct nlmsghdr *pNlh, size_t cbBuf, int iType, const void
+     pNlh->nlmsg_len = (unsigned)(NLMSG_ALIGN(pNlh->nlmsg_len) + RTA_ALIGN(cbAttr));
+     return 0;
+ }
++/** if_nametoindex() equivalent via SIOCGIFINDEX (glibc's if_nametoindex
++ * lives in <net/if.h>, which we cannot include alongside the kernel uapi
++ * headers). Returns 0 if the name is unknown. */
++static unsigned ifIndexGet(const char *pszIfName)
++{
++    int const fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0)
++        return 0;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    snprintf(IfReq.ifr_name, sizeof(IfReq.ifr_name), "%s", pszIfName);
++    unsigned const uIdx = ioctl(fd, SIOCGIFINDEX, &IfReq) == 0 ? (unsigned)IfReq.ifr_ifindex : 0;
++    close(fd);
++    return uIdx;
++}
++
++
++/** Creates a persistent TAP interface owned by the given uid. */
++static int tapCreate(const char *pszIfName, uid_t uidOwner)
++{
++    int fd = open("/dev/net/tun", O_RDWR);
++    if (fd < 0)
++        return -errno;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    IfReq.ifr_flags = IFF_TAP | IFF_NO_PI;
++    snprintf(IfReq.ifr_name, sizeof(IfReq.ifr_name), "%s", pszIfName);
++
++    int rc;
++    if (ioctl(fd, TUNSETIFF, &IfReq) < 0)
++        rc = -errno;
++    else if (ioctl(fd, TUNSETPERSIST, 1) < 0)
++        rc = -errno;
++    else if (ioctl(fd, TUNSETOWNER, uidOwner) < 0)
++        rc = -errno;
++    else
++        rc = 0;
++    close(fd);
++    return rc;
++}
++
++
++/** Clears persistence of a TAP interface so it is removed on last close. */
++static int tapDestroy(const char *pszIfName)
++{
++    int fd = open("/dev/net/tun", O_RDWR);
++    if (fd < 0)
++        return -errno;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    snprintf(IfReq.ifr_name, sizeof(IfReq.ifr_name), "%s", pszIfName);
++    if (ioctl(fd, TUNSETIFF, &IfReq) < 0)
++    {
++        int const rc = -errno;
++        close(fd);
++        return rc;
++    }
++    int const rc = ioctl(fd, TUNSETPERSIST, 0) < 0 ? -errno : 0;
++    close(fd);
++    return rc;
++}
+ 
+ 
+ static int linkSetMaster(int fdNetlink, const char *pszIfName, unsigned uMasterIdx)
+ {
+-    int const iIfIdx = (int)if_nametoindex(pszIfName);
++    int const iIfIdx = (int)ifIndexGet(pszIfName);
+     if (iIfIdx <= 0)
+         return -ENODEV;
+ 
+@@ -196,7 +269,7 @@ static int linkSetMaster(int fdNetlink, const char *pszIfName, unsigned uMasterI
+ 
+ static int linkSetUpDown(int fdNetlink, const char *pszIfName, bool fUp)
+ {
+-    int const iIfIdx = (int)if_nametoindex(pszIfName);
++    int const iIfIdx = (int)ifIndexGet(pszIfName);
+     if (iIfIdx <= 0)
+         return -ENODEV;
+ 
+@@ -249,6 +322,9 @@ int main(int argc, char **argv)
+     }
+ 
+     bool fAttach;
++    bool fCreate = false;
++    bool fDestroy = false;
++    uid_t uidOwner = 0;
+     if (strcmp(pszAction, "attach") == 0)
+     {
+         if (argc != 4)
+@@ -266,16 +342,64 @@ int main(int argc, char **argv)
+             return usage();
+         fAttach = false;
+     }
++    else if (strcmp(pszAction, "create") == 0)
++    {
++        if (argc != 4)
++            return usage();
++        char *pszEnd = NULL;
++        unsigned long const ulUid = strtoul(argv[3], &pszEnd, 10);
++        if (pszEnd == argv[3] || *pszEnd != '\0' || ulUid > 0xffffffffU)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: invalid uid '%s'\n", argv[3]);
++            return EXIT_FAILURE;
++        }
++        /* The TAP may only be handed to the calling user. */
++        if ((uid_t)ulUid != getuid())
++        {
++            fprintf(stderr, "VBoxNetBrCtl: uid '%s' does not match the calling user\n", argv[3]);
++            return EXIT_FAILURE;
++        }
++        uidOwner = (uid_t)ulUid;
++        fCreate = true;
++        fAttach = false;
++    }
++    else if (strcmp(pszAction, "destroy") == 0)
++    {
++        if (argc != 3)
++            return usage();
++        fDestroy = true;
++        fAttach = false;
++    }
+     else
+         return usage();
+ 
++    if (fCreate)
++    {
++        rc = tapCreate(pszIfName, uidOwner);
++        if (rc != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: failed to create '%s': %s\n", pszIfName, strerror(-rc));
++            return EXIT_FAILURE;
++        }
++        return EXIT_SUCCESS;
++    }
++    if (fDestroy)
++    {
++        rc = tapDestroy(pszIfName);
++        if (rc != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: failed to destroy '%s': %s\n", pszIfName, strerror(-rc));
++            return EXIT_FAILURE;
++        }
++        return EXIT_SUCCESS;
++    }
+     int const fdNetlink = nlOpen();
+     if (fdNetlink < 0)
+         return EXIT_FAILURE;
+ 
+     if (fAttach)
+     {
+-        unsigned const uBridgeIdx = if_nametoindex(argv[3]);
++        unsigned const uBridgeIdx = ifIndexGet(argv[3]);
+         if (uBridgeIdx == 0)
+         {
+             fprintf(stderr, "VBoxNetBrCtl: bridge '%s' does not exist\n", argv[3]);
+-- 
+2.54.0
+

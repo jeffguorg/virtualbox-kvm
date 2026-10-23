@@ -1,0 +1,33 @@
+#!/bin/bash
+
+post_install() {
+  cat <<'EOF'
+==> virtualbox-kvm-jeffguorg-patched installed.
+
+This build is driverless: it uses Linux KVM (/dev/kvm) and needs no
+VirtualBox kernel modules. There is nothing to modprobe and no service
+to enable.
+
+Quick start with host-bridge networking:
+
+  1. Create the host bridge once (static IP + dnsmasq on vboxbr0):
+       sudo vboxbr0-setup
+
+  2. Attach a VM to it:
+       VBoxManage modifyvm <vm> --nic1 linuxbridge --nic-property1 bridge=vboxbr0
+     (or select "LinuxBridge" in the GUI network settings)
+
+  3. Run the GUI with:  VirtualBox
+
+Notes:
+  - Your user must be able to access /dev/kvm (usually via the 'kvm' group).
+  - On Intel Tiger Lake and newer hosts, add 'split_lock_detect=off' to the
+    kernel command line if guests appear to hang.
+  - VBoxNetBrCtl is installed setuid root; it only manipulates 'vboxtap*'
+    interfaces.
+EOF
+}
+
+post_upgrade() {
+  post_install
+}

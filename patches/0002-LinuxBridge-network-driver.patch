@@ -1,0 +1,1505 @@
+From cc8a59a6cb2bba0f2f3209ea8cdf125768576239 Mon Sep 17 00:00:00 2001
+From: guochao <guochao@local>
+Date: Tue, 20 Oct 2026 22:11:32 +0800
+Subject: [PATCH 1/5] Network: LinuxBridge driver - TAP + host bridge
+ networking without kernel modules
+
+Adds a driverless network backend for the KVM backend, attachable via the
+generic network attachment:
+
+  VBoxManage modifyvm <vm> --nic<N> generic --driver<N> LinuxBridge       --property<N> bridge=vboxbr0
+
+Components:
+
+- DrvLinuxBridge (src/VBox/Devices/Network/DrvLinuxBridge.cpp): PDM network
+  transport driver. Opens /dev/net/tun and creates a non-persistent
+  'vboxtapX' interface (IFF_TAP|IFF_NO_PI), then enslaves it to the
+  configured host bridge via the setuid helper. Frame pump modeled on
+  DrvTAP; GSO frames are carved into plain Ethernet frames.
+
+- VBoxNetBrCtl (src/VBox/HostDrivers/adpctl/): setuid-root helper talking
+  rtnetlink directly (no external tools, no shell). Restricted to
+  'vboxtap*' interface names so unprivileged callers can only manipulate
+  TAP devices they could create themselves. Linked statically: glibc
+  ignores RUNPATH=$ORIGIN for setuid binaries (AT_SECURE), so a dynamic
+  VBoxRT.so dependency would be unresolvable.
+
+- vboxbr0-setup.sh (src/VBox/Installer/linux/): host-side one-time setup
+  of the vboxbr0 bridge (static IP) plus a dnsmasq instance bound to the
+  bridge only, providing DHCP (and DNS) to guests.
+
+- VMMStatic unit-test fix: with VBOX_WITH_KVM, keep NEMR3Native-linux-x86
+  in VMMStatic (APICR3/PDMR3DevMiscHlp reference the new NEMR3Kvm* entry
+  points), and guard the NEMR3RunGC/NEMR3CanExecuteGuest/NEMHC*/NEMImport/
+  dirty-tracking/A20 definitions with VBOX_WITH_NATIVE_NEM so the stub
+  fallbacks in NEMR3.cpp/NEMAll.cpp win in the unit-test configuration,
+  which filters VBOX_WITH_NATIVE_NEM out of its DEFS.
+
+Install: VBoxNetBrCtl is installed setuid root (install.sh, chmod 4511,
+root-owned). Verified end-to-end on VirtualBox 7.2.20: full build incl.
+Qt GUI, setuid attach/detach smoke test against a live vboxbr0 + dnsmasq.
+---
+ src/VBox/Devices/Makefile.kmk                 |   5 +-
+ src/VBox/Devices/Network/DrvLinuxBridge.cpp   | 787 ++++++++++++++++++
+ src/VBox/Devices/build/VBoxDD.cpp             |   5 +
+ src/VBox/Devices/build/VBoxDD.h               |   3 +
+ src/VBox/HostDrivers/adpctl/Makefile.kmk      |  11 +
+ src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp  | 316 +++++++
+ src/VBox/Installer/linux/install.sh           |   1 +
+ src/VBox/Installer/linux/vboxbr0-setup.sh     |  79 ++
+ src/VBox/VMM/Makefile.kmk                     |   2 +-
+ .../VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h |   8 +
+ .../target-x86/NEMR3Native-linux-x86.cpp      |  12 +
+ 11 files changed, 1226 insertions(+), 3 deletions(-)
+ create mode 100644 src/VBox/Devices/Network/DrvLinuxBridge.cpp
+ create mode 100644 src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+ create mode 100755 src/VBox/Installer/linux/vboxbr0-setup.sh
+
+diff --git a/src/VBox/Devices/Makefile.kmk b/src/VBox/Devices/Makefile.kmk
+index 146f5548..c811d9fb 100644
+--- a/src/VBox/Devices/Makefile.kmk
++++ b/src/VBox/Devices/Makefile.kmk
+@@ -836,8 +836,9 @@ if !defined(VBOX_ONLY_EXTPACKS) && "$(intersects $(KBUILD_TARGET_ARCH),$(VBOX_SU
+  endif # freebsd
+ 
+  VBoxDD_SOURCES.linux += \
+- 	Network/DrvTAP.cpp \
+- 	Parallel/DrvHostParallel.cpp
++	Network/DrvTAP.cpp \
++	Network/DrvLinuxBridge.cpp \
++	Parallel/DrvHostParallel.cpp
+ 
+  ifeq ($(KBUILD_TARGET),solaris)
+   ifdef VBOX_WITH_SUID_WRAPPER
+diff --git a/src/VBox/Devices/Network/DrvLinuxBridge.cpp b/src/VBox/Devices/Network/DrvLinuxBridge.cpp
+new file mode 100644
+index 00000000..77468139
+--- /dev/null
++++ b/src/VBox/Devices/Network/DrvLinuxBridge.cpp
+@@ -0,0 +1,787 @@
++/* $Id$ */
++/** @file
++ * DrvLinuxBridge - Linux TAP network transport driver with host bridge attachment.
++ *
++ * This driver connects a virtual NIC to a Linux host bridge (e.g. "vboxbr0")
++ * without requiring any VirtualBox kernel modules:
++ *
++ *      1. It opens /dev/net/tun and creates a TAP interface named "vboxtapX"
++ *         (IFF_TAP|IFF_NO_PI, non-persistent, so it vanishes when the VM
++ *         releases the fd).
++ *      2. It invokes the setuid-root helper "VBoxNetBrCtl" to enslave the TAP
++ *         interface to the configured host bridge and bring it up.  The
++ *         helper is restricted to "vboxtap*" names and talks rtnetlink
++ *         directly, so no external tools are involved.
++ *
++ * The driver is attached via the generic network attachment:
++ *      VBoxManage modifyvm <vm> --nic<N> generic --driver<N> LinuxBridge \
++ *          --property<N> bridge=vboxbr0
++ *
++ * The frame pump is modeled on DrvTAP.cpp.
++ */
++
++/*
++ * Copyright (C) 2026 guochao <local>
++ *
++ * This file is part of VirtualBox base platform packages, as
++ * available from https://www.virtualbox.org.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation, in version 3 of the
++ * License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <https://www.gnu.org/licenses>.
++ *
++ * SPDX-License-Identifier: GPL-3.0-only
++ */
++
++
++/*********************************************************************************************************************************
++*   Header Files                                                                                                                 *
++*********************************************************************************************************************************/
++#define LOG_GROUP LOG_GROUP_DRV_TUN
++#include <VBox/log.h>
++#include <VBox/vmm/pdmdrv.h>
++#include <VBox/vmm/pdmnetifs.h>
++#include <VBox/vmm/pdmnetinline.h>
++
++#include <iprt/assert.h>
++#include <iprt/env.h>
++#include <iprt/err.h>
++#include <iprt/file.h>
++#include <iprt/mem.h>
++#include <iprt/path.h>
++#include <iprt/pipe.h>
++#include <iprt/process.h>
++#include <iprt/string.h>
++#include <iprt/thread.h>
++#include <iprt/uuid.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <sys/poll.h>
++#include <unistd.h>
++/* linux/if.h + linux/if_tun.h give us struct ifreq/IFF_* without
++ * conflicting with glibc's <net/if.h>, which must not be mixed in. */
++#include <linux/if.h>
++#include <linux/if_tun.h>
++
++#include "VBoxDD.h"
++
++
++/*********************************************************************************************************************************
++*   Structures and Typedefs                                                                                                      *
++*********************************************************************************************************************************/
++/**
++ * LinuxBridge driver instance data.
++ *
++ * @implements PDMINETWORKUP
++ */
++typedef struct DRVLINUXBRIDGE
++{
++    /** The network interface. */
++    PDMINETWORKUP           INetworkUp;
++    /** The network port interface of the driver/device above us. */
++    PPDMINETWORKDOWN        pIAboveNet;
++    /** Pointer to the driver instance. */
++    PPDMDRVINS              pDrvIns;
++    /** TAP device file handle. */
++    RTFILE                  hFileDevice;
++    /** The TAP device name (always "vboxtap*" prefixed). */
++    char                   *pszIfName;
++    /** The host bridge name. */
++    char                   *pszBridge;
++    /** Explicit path of the VBoxNetBrCtl helper, NULL for default lookup. */
++    char                   *pszCtlPath;
++    /** Whether the helper successfully attached the TAP to the bridge. */
++    bool                    fAttached;
++    /** Whether to detach on terminate (default true). */
++    bool                    fDetachOnTerminate;
++    /** The write end of the control pipe. */
++    RTPIPE                  hPipeWrite;
++    /** The read end of the control pipe. */
++    RTPIPE                  hPipeRead;
++    /** Reader thread. */
++    PPDMTHREAD              pThread;
++    /** Transmit lock used by drvLinuxBridgeNetworkUp_BeginXmit. */
++    RTCRITSECT              XmitLock;
++
++#ifdef VBOX_WITH_STATISTICS
++    /** Number of sent packets. */
++    STAMCOUNTER             StatPktSent;
++    /** Number of sent bytes. */
++    STAMCOUNTER             StatPktSentBytes;
++    /** Number of received packets. */
++    STAMCOUNTER             StatPktRecv;
++    /** Number of received bytes. */
++    STAMCOUNTER             StatPktRecvBytes;
++    /** Profiling packet transmit runs. */
++    STAMPROFILE             StatTransmit;
++    /** Profiling packet receive runs. */
++    STAMPROFILEADV          StatReceive;
++#endif /* VBOX_WITH_STATISTICS */
++} DRVLINUXBRIDGE, *PDRVLINUXBRIDGE;
++
++
++/** Converts a pointer to DRVLINUXBRIDGE::INetworkUp to a PDRVLINUXBRIDGE. */
++#define PDMINETWORKUP_2_DRVLINUXBRIDGE(pInterface) \
++    ( (PDRVLINUXBRIDGE)((uintptr_t)pInterface - RT_UOFFSETOF(DRVLINUXBRIDGE, INetworkUp)) )
++
++
++/*********************************************************************************************************************************
++*   Internal Functions                                                                                                           *
++*********************************************************************************************************************************/
++/**
++ * Locates the VBoxNetBrCtl helper executable.
++ *
++ * @returns VBox status code.
++ * @param   pThis       The instance data.
++ * @param   pszBuf      Where to store the full path.
++ * @param   cbBuf       Size of the buffer.
++ */
++static int drvLinuxBridgeResolveCtlPath(PDRVLINUXBRIDGE pThis, char *pszBuf, size_t cbBuf)
++{
++    int rc;
++    if (pThis->pszCtlPath && *pThis->pszCtlPath)
++        rc = RTStrCopy(pszBuf, cbBuf, pThis->pszCtlPath);
++    else
++    {
++        rc = RTPathExecDir(pszBuf, cbBuf - sizeof("/VBoxNetBrCtl"));
++        if (RT_SUCCESS(rc))
++            rc = RTStrCat(pszBuf, cbBuf, "/VBoxNetBrCtl");
++    }
++    if (RT_FAILURE(rc))
++        return rc;
++    if (!RTPathExists(pszBuf))
++        return VERR_FILE_NOT_FOUND;
++    return VINF_SUCCESS;
++}
++
++
++/**
++ * Runs "VBoxNetBrCtl <action> <ifname> [bridge]" and waits for it.
++ *
++ * @returns VBox status code.
++ * @param   pThis       The instance data.
++ * @param   pszAction   "attach" or "detach".
++ * @param   pszBridge   The bridge name, NULL for detach.
++ */
++static int drvLinuxBridgeRunCtl(PDRVLINUXBRIDGE pThis, const char *pszAction, const char *pszBridge)
++{
++    char szCtl[RTPATH_MAX];
++    int rc = drvLinuxBridgeResolveCtlPath(pThis, szCtl, sizeof(szCtl));
++    if (RT_FAILURE(rc))
++    {
++        LogRel(("LinuxBridge#%d: cannot find VBoxNetBrCtl helper (%Rrc)\n", pThis->pDrvIns->iInstance, rc));
++        return rc;
++    }
++
++    const char *apszArgs[5];
++    apszArgs[0] = szCtl;
++    apszArgs[1] = pszAction;
++    apszArgs[2] = pThis->pszIfName;
++    apszArgs[3] = pszBridge;
++    apszArgs[4] = NULL;
++
++    RTPROCESS hProc;
++    rc = RTProcCreate(szCtl, apszArgs, RTENV_DEFAULT, 0 /*fFlags*/, &hProc);
++    if (RT_FAILURE(rc))
++    {
++        LogRel(("LinuxBridge#%d: failed to execute '%s %s %s %s': %Rrc\n",
++                pThis->pDrvIns->iInstance, szCtl, pszAction, pThis->pszIfName,
++                pszBridge ? pszBridge : "", rc));
++        return rc;
++    }
++
++    RTPROCSTATUS Status;
++    rc = RTProcWait(hProc, 0 /*fFlags*/, &Status);
++    if (RT_FAILURE(rc))
++        return rc;
++    if (Status.enmReason != RTPROCEXITREASON_NORMAL || Status.iStatus != 0)
++    {
++        LogRel(("LinuxBridge#%d: '%s %s %s %s' failed: iStatus=%d enmReason=%d\n",
++                pThis->pDrvIns->iInstance, szCtl, pszAction, pThis->pszIfName,
++                pszBridge ? pszBridge : "", Status.iStatus, Status.enmReason));
++        return VERR_ACCESS_DENIED;
++    }
++    return VINF_SUCCESS;
++}
++
++
++/**
++ * Creates the TAP interface and attaches it to the host bridge.
++ *
++ * @returns VBox status code.
++ * @param   pThis       The instance data.
++ */
++static int drvLinuxBridgeAttach(PDRVLINUXBRIDGE pThis)
++{
++    /*
++     * Open the TUN/TAP control device and create the interface.
++     */
++    int fd = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
++    if (fd < 0)
++        return PDMDrvHlpVMSetError(pThis->pDrvIns, VERR_HOSTIF_INIT_FAILED, RT_SRC_POS,
++                                   N_("Failed to open /dev/net/tun: %s (check tun module and group access)"),
++                                   strerror(errno));
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    IfReq.ifr_flags = IFF_TAP | IFF_NO_PI;
++    RTStrCopy(IfReq.ifr_name, sizeof(IfReq.ifr_name), pThis->pszIfName);
++    if (ioctl(fd, TUNSETIFF, &IfReq) < 0)
++    {
++        int const iErr = errno;
++        close(fd);
++        return PDMDrvHlpVMSetError(pThis->pDrvIns, VERR_HOSTIF_INIT_FAILED, RT_SRC_POS,
++                                   N_("TUNSETIFF failed for '%s': %s"), pThis->pszIfName, strerror(iErr));
++    }
++
++    /* TUNSETIFF returns the name it actually bound; with a requested name
++     * present it is always exactly that name (created or attached), so no
++     * write-back is needed and pszIfName stays authoritative. */
++    pThis->hFileDevice = (RTFILE)(uintptr_t)fd;
++
++    /*
++     * Enslave to the host bridge via the setuid helper.
++     */
++    int rc = drvLinuxBridgeRunCtl(pThis, "attach", pThis->pszBridge);
++    if (RT_FAILURE(rc))
++        return PDMDrvHlpVMSetError(pThis->pDrvIns, VERR_HOSTIF_INIT_FAILED, RT_SRC_POS,
++                                   N_("Failed to attach '%s' to bridge '%s' via VBoxNetBrCtl; "
++                                      "is the bridge configured and VBoxNetBrCtl installed setuid root?"),
++                                   pThis->pszIfName, pThis->pszBridge);
++    pThis->fAttached = true;
++    LogRel(("LinuxBridge#%d: attached '%s' to bridge '%s'\n",
++            pThis->pDrvIns->iInstance, pThis->pszIfName, pThis->pszBridge));
++    return VINF_SUCCESS;
++}
++
++
++/**
++ * @interface_method_impl{PDMINETWORKUP,pfnBeginXmit}
++ */
++static DECLCALLBACK(int) drvLinuxBridgeNetworkUp_BeginXmit(PPDMINETWORKUP pInterface, bool fOnWorkerThread)
++{
++    RT_NOREF(fOnWorkerThread);
++    PDRVLINUXBRIDGE pThis = PDMINETWORKUP_2_DRVLINUXBRIDGE(pInterface);
++    return RTCritSectEnter(&pThis->XmitLock);
++}
++
++
++/**
++ * @interface_method_impl{PDMINETWORKUP,pfnAllocBuf}
++ */
++static DECLCALLBACK(int) drvLinuxBridgeNetworkUp_AllocBuf(PPDMINETWORKUP pInterface, size_t cbMin,
++                                                          PCPDMNETWORKGSO pGso, PPPDMSCATTERGATHER ppSgBuf)
++{
++    RT_NOREF(pInterface);
++    PPDMSCATTERGATHER pSgBuf = (PPDMSCATTERGATHER)RTMemAlloc(  RT_ALIGN_Z(sizeof(*pSgBuf), 16)
++                                                             + RT_ALIGN_Z(cbMin, 16)
++                                                             + (pGso ? RT_ALIGN_Z(sizeof(*pGso), 16) : 0));
++    if (!pSgBuf)
++        return VERR_NO_MEMORY;
++
++    pSgBuf->fFlags         = PDMSCATTERGATHER_FLAGS_MAGIC | PDMSCATTERGATHER_FLAGS_OWNER_1;
++    pSgBuf->cbUsed         = 0;
++    pSgBuf->cbAvailable    = RT_ALIGN_Z(cbMin, 16);
++    pSgBuf->pvAllocator    = NULL;
++    if (!pGso)
++        pSgBuf->pvUser     = NULL;
++    else
++    {
++        pSgBuf->pvUser     = (uint8_t *)(pSgBuf + 1) + pSgBuf->cbAvailable;
++        *(PPDMNETWORKGSO)pSgBuf->pvUser = *pGso;
++    }
++    pSgBuf->cSegs          = 1;
++    pSgBuf->aSegs[0].cbSeg = pSgBuf->cbAvailable;
++    pSgBuf->aSegs[0].pvSeg = pSgBuf + 1;
++
++    *ppSgBuf = pSgBuf;
++    return VINF_SUCCESS;
++}
++
++
++/**
++ * @interface_method_impl{PDMINETWORKUP,pfnFreeBuf}
++ */
++static DECLCALLBACK(int) drvLinuxBridgeNetworkUp_FreeBuf(PPDMINETWORKUP pInterface, PPDMSCATTERGATHER pSgBuf)
++{
++    RT_NOREF(pInterface);
++    if (pSgBuf)
++    {
++        Assert((pSgBuf->fFlags & PDMSCATTERGATHER_FLAGS_MAGIC_MASK) == PDMSCATTERGATHER_FLAGS_MAGIC);
++        pSgBuf->fFlags = 0;
++        RTMemFree(pSgBuf);
++    }
++    return VINF_SUCCESS;
++}
++
++
++/**
++ * @interface_method_impl{PDMINETWORKUP,pfnSendBuf}
++ */
++static DECLCALLBACK(int) drvLinuxBridgeNetworkUp_SendBuf(PPDMINETWORKUP pInterface, PPDMSCATTERGATHER pSgBuf, bool fOnWorkerThread)
++{
++    RT_NOREF(fOnWorkerThread);
++    PDRVLINUXBRIDGE pThis = PDMINETWORKUP_2_DRVLINUXBRIDGE(pInterface);
++    STAM_COUNTER_INC(&pThis->StatPktSent);
++    STAM_COUNTER_ADD(&pThis->StatPktSentBytes, pSgBuf->cbUsed);
++    STAM_PROFILE_START(&pThis->StatTransmit, a);
++
++    AssertPtr(pSgBuf);
++    Assert((pSgBuf->fFlags & PDMSCATTERGATHER_FLAGS_MAGIC_MASK) == PDMSCATTERGATHER_FLAGS_MAGIC);
++    Assert(RTCritSectIsOwner(&pThis->XmitLock));
++
++    int rc;
++    if (!pSgBuf->pvUser)
++        rc = RTFileWrite(pThis->hFileDevice, pSgBuf->aSegs[0].pvSeg, pSgBuf->cbUsed, NULL);
++    else
++    {
++        /* GSO: carve into plain frames, the TAP device has no offload headers. */
++        uint8_t         abHdrScratch[256];
++        uint8_t const  *pbFrame = (uint8_t const *)pSgBuf->aSegs[0].pvSeg;
++        PCPDMNETWORKGSO pGso    = (PCPDMNETWORKGSO)pSgBuf->pvUser;
++        uint32_t const  cSegs   = PDMNetGsoCalcSegmentCount(pGso, pSgBuf->cbUsed);
++        Assert(cSegs > 1);
++        rc = VINF_SUCCESS;
++        for (size_t iSeg = 0; iSeg < cSegs; iSeg++)
++        {
++            uint32_t cbSegFrame;
++            void *pvSegFrame = PDMNetGsoCarveSegmentQD(pGso, (uint8_t *)pbFrame, pSgBuf->cbUsed, abHdrScratch,
++                                                       iSeg, cSegs, &cbSegFrame);
++            rc = RTFileWrite(pThis->hFileDevice, pvSegFrame, cbSegFrame, NULL);
++            if (RT_FAILURE(rc))
++                break;
++        }
++    }
++
++    pSgBuf->fFlags = 0;
++    RTMemFree(pSgBuf);
++
++    STAM_PROFILE_STOP(&pThis->StatTransmit, a);
++    if (RT_FAILURE(rc))
++        rc = rc == VERR_NO_MEMORY ? VERR_NET_NO_BUFFER_SPACE : VERR_NET_DOWN;
++    return rc;
++}
++
++
++/**
++ * @interface_method_impl{PDMINETWORKUP,pfnEndXmit}
++ */
++static DECLCALLBACK(void) drvLinuxBridgeNetworkUp_EndXmit(PPDMINETWORKUP pInterface)
++{
++    PDRVLINUXBRIDGE pThis = PDMINETWORKUP_2_DRVLINUXBRIDGE(pInterface);
++    RTCritSectLeave(&pThis->XmitLock);
++}
++
++
++/**
++ * @interface_method_impl{PDMINETWORKUP,pfnSetPromiscuousMode}
++ */
++static DECLCALLBACK(void) drvLinuxBridgeNetworkUp_SetPromiscuousMode(PPDMINETWORKUP pInterface, bool fPromiscuous)
++{
++    RT_NOREF(pInterface, fPromiscuous);
++    /* Bridge port membership already delivers what the guest needs. */
++}
++
++
++/**
++ * @interface_method_impl{PDMINETWORKUP,pfnNotifyLinkChanged}
++ */
++static DECLCALLBACK(void) drvLinuxBridgeNetworkUp_NotifyLinkChanged(PPDMINETWORKUP pInterface, PDMNETWORKLINKSTATE enmLinkState)
++{
++    RT_NOREF(pInterface, enmLinkState);
++    LogFlow(("drvLinuxBridgeNetworkUp_NotifyLinkChanged: enmLinkState=%d\n", enmLinkState));
++}
++
++
++/**
++ * Asynchronous I/O thread for handling receive.
++ *
++ * @returns VINF_SUCCESS (ignored).
++ * @param   pDrvIns     Pointer to a DRVLINUXBRIDGE driver instance.
++ * @param   pThread     Thread handle.
++ */
++static DECLCALLBACK(int) drvLinuxBridgeAsyncIoThread(PPDMDRVINS pDrvIns, PPDMTHREAD pThread)
++{
++    PDRVLINUXBRIDGE pThis = PDMINS_2_DATA(pDrvIns, PDRVLINUXBRIDGE);
++    LogFlow(("drvLinuxBridgeAsyncIoThread: pThis=%p\n", pThis));
++
++    if (pThread->enmState == PDMTHREADSTATE_INITIALIZING)
++        return VINF_SUCCESS;
++
++    STAM_PROFILE_ADV_START(&pThis->StatReceive, a);
++
++    /*
++     * Polling loop.
++     */
++    while (pThread->enmState == PDMTHREADSTATE_RUNNING)
++    {
++        struct pollfd aFDs[2];
++        aFDs[0].fd      = RTFileToNative(pThis->hFileDevice);
++        aFDs[0].events  = POLLIN | POLLPRI;
++        aFDs[0].revents = 0;
++        aFDs[1].fd      = RTPipeToNative(pThis->hPipeRead);
++        aFDs[1].events  = POLLIN | POLLPRI | POLLERR | POLLHUP;
++        aFDs[1].revents = 0;
++        STAM_PROFILE_ADV_STOP(&pThis->StatReceive, a);
++        errno = 0;
++        int rc = poll(&aFDs[0], RT_ELEMENTS(aFDs), -1 /* infinite */);
++
++        if (pThread->enmState != PDMTHREADSTATE_RUNNING)
++            break;
++
++        STAM_PROFILE_ADV_START(&pThis->StatReceive, a);
++        if (    rc > 0
++            &&  (aFDs[0].revents & (POLLIN | POLLPRI))
++            &&  !aFDs[1].revents)
++        {
++            /*
++             * Read one frame and pass it up.
++             */
++            char achBuf[16384];
++            size_t cbRead = 0;
++            rc = RTFileRead(pThis->hFileDevice, achBuf, sizeof(achBuf), &cbRead);
++            if (RT_SUCCESS(rc))
++            {
++                STAM_PROFILE_ADV_STOP(&pThis->StatReceive, a);
++                int rc1 = pThis->pIAboveNet->pfnWaitReceiveAvail(pThis->pIAboveNet, RT_INDEFINITE_WAIT);
++                STAM_PROFILE_ADV_START(&pThis->StatReceive, a);
++                if (RT_FAILURE(rc1))
++                    continue;
++
++                STAM_COUNTER_INC(&pThis->StatPktRecv);
++                STAM_COUNTER_ADD(&pThis->StatPktRecvBytes, cbRead);
++                rc1 = pThis->pIAboveNet->pfnReceive(pThis->pIAboveNet, achBuf, cbRead);
++                AssertRC(rc1);
++            }
++            else
++            {
++                LogFlow(("drvLinuxBridgeAsyncIoThread: RTFileRead -> %Rrc\n", rc));
++                if (rc == VERR_INVALID_HANDLE)
++                    break;
++                RTThreadYield();
++            }
++        }
++        else if (rc > 0 && aFDs[1].revents)
++        {
++            LogFlow(("drvLinuxBridgeAsyncIoThread: control message: enmState=%d revents=%#x\n",
++                     pThread->enmState, aFDs[1].revents));
++            if (aFDs[1].revents & (POLLHUP | POLLERR | POLLNVAL))
++                break;
++
++            /* drain the pipe */
++            char ch;
++            size_t cbRead;
++            RTPipeRead(pThis->hPipeRead, &ch, 1, &cbRead);
++        }
++        else
++        {
++            if (errno == EINTR)
++                Log(("drvLinuxBridgeAsyncIoThread: EINTR, continuing\n"));
++            else
++                AssertMsgFailed(("rc=%d revents=%#x,%#x errno=%d %s\n",
++                                 rc, aFDs[0].revents, aFDs[1].revents, errno, strerror(errno)));
++            RTThreadYield();
++        }
++    }
++
++    LogFlow(("drvLinuxBridgeAsyncIoThread: returns\n"));
++    STAM_PROFILE_ADV_STOP(&pThis->StatReceive, a);
++    return VINF_SUCCESS;
++}
++
++
++/**
++ * Unblock the receive thread so it can respond to a state change.
++ *
++ * @returns VBox status code.
++ * @param   pDrvIns     The pcnet device instance.
++ * @param   pThread     The send thread.
++ */
++static DECLCALLBACK(int) drvLinuxBridgeAsyncIoWakeup(PPDMDRVINS pDrvIns, PPDMTHREAD pThread)
++{
++    RT_NOREF(pThread);
++    PDRVLINUXBRIDGE pThis = PDMINS_2_DATA(pDrvIns, PDRVLINUXBRIDGE);
++
++    size_t cbIgnored;
++    int rc = RTPipeWrite(pThis->hPipeWrite, "", 1, &cbIgnored);
++    AssertRC(rc);
++
++    return VINF_SUCCESS;
++}
++
++
++/**
++ * @interface_method_impl{PDMIBASE,pfnQueryInterface}
++ */
++static DECLCALLBACK(void *) drvLinuxBridgeQueryInterface(PPDMIBASE pInterface, const char *pszIID)
++{
++    PPDMDRVINS      pDrvIns = PDMIBASE_2_PDMDRV(pInterface);
++    PDRVLINUXBRIDGE pThis   = PDMINS_2_DATA(pDrvIns, PDRVLINUXBRIDGE);
++
++    PDMIBASE_RETURN_INTERFACE(pszIID, PDMIBASE, &pDrvIns->IBase);
++    PDMIBASE_RETURN_INTERFACE(pszIID, PDMINETWORKUP, &pThis->INetworkUp);
++    return NULL;
++}
++
++
++/**
++ * Destruct a driver instance.
++ *
++ * Most VM resources are freed by the VM. This callback is provided so that any non-VM
++ * resources can be freed correctly.
++ *
++ * @param   pDrvIns     The driver instance data.
++ */
++static DECLCALLBACK(void) drvLinuxBridgeDestruct(PPDMDRVINS pDrvIns)
++{
++    LogFlow(("drvLinuxBridgeDestruct\n"));
++    PDRVLINUXBRIDGE pThis = PDMINS_2_DATA(pDrvIns, PDRVLINUXBRIDGE);
++    PDMDRV_CHECK_VERSIONS_RETURN_VOID(pDrvIns);
++
++    int rc;
++
++    /*
++     * Detach the TAP from the bridge.  Best effort only: the TAP interface is
++     * non-persistent, so closing the fd removes it (and its bridge membership)
++     * anyway.  This just keeps the host tidy when the fd outlives the bridge.
++     */
++    if (pThis->fAttached && pThis->fDetachOnTerminate)
++    {
++        rc = drvLinuxBridgeRunCtl(pThis, "detach", NULL /*pszBridge*/);
++        if (RT_FAILURE(rc))
++            LogRel(("LinuxBridge#%d: warning: failed to detach '%s' (%Rrc)\n",
++                    pDrvIns->iInstance, pThis->pszIfName, rc));
++        pThis->fAttached = false;
++    }
++
++    /*
++     * Terminate the control pipe and close the TAP device.
++     */
++    if (pThis->hPipeWrite != NIL_RTPIPE)
++    {
++        rc = RTPipeClose(pThis->hPipeWrite); AssertRC(rc);
++        pThis->hPipeWrite = NIL_RTPIPE;
++    }
++    if (pThis->hPipeRead != NIL_RTPIPE)
++    {
++        rc = RTPipeClose(pThis->hPipeRead); AssertRC(rc);
++        pThis->hPipeRead = NIL_RTPIPE;
++    }
++
++    if (pThis->hFileDevice != NIL_RTFILE)
++    {
++        rc = RTFileClose(pThis->hFileDevice); AssertRC(rc);
++        pThis->hFileDevice = NIL_RTFILE;
++    }
++
++    PDMDrvHlpMMHeapFree(pDrvIns, pThis->pszIfName);
++    pThis->pszIfName = NULL;
++    PDMDrvHlpMMHeapFree(pDrvIns, pThis->pszBridge);
++    pThis->pszBridge = NULL;
++    PDMDrvHlpMMHeapFree(pDrvIns, pThis->pszCtlPath);
++    pThis->pszCtlPath = NULL;
++
++    if (RTCritSectIsInitialized(&pThis->XmitLock))
++        RTCritSectDelete(&pThis->XmitLock);
++
++#ifdef VBOX_WITH_STATISTICS
++    PDMDrvHlpSTAMDeregister(pDrvIns, &pThis->StatPktSent);
++    PDMDrvHlpSTAMDeregister(pDrvIns, &pThis->StatPktSentBytes);
++    PDMDrvHlpSTAMDeregister(pDrvIns, &pThis->StatPktRecv);
++    PDMDrvHlpSTAMDeregister(pDrvIns, &pThis->StatPktRecvBytes);
++    PDMDrvHlpSTAMDeregister(pDrvIns, &pThis->StatTransmit);
++    PDMDrvHlpSTAMDeregister(pDrvIns, &pThis->StatReceive);
++#endif /* VBOX_WITH_STATISTICS */
++}
++
++
++/**
++ * Construct a LinuxBridge network transport driver instance.
++ *
++ * @copydoc FNPDMDRVCONSTRUCT
++ */
++static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE pCfg, uint32_t fFlags)
++{
++    RT_NOREF(fFlags);
++    PDMDRV_CHECK_VERSIONS_RETURN(pDrvIns);
++    PDRVLINUXBRIDGE pThis = PDMINS_2_DATA(pDrvIns, PDRVLINUXBRIDGE);
++    PCPDMDRVHLPR3   pHlp  = pDrvIns->pHlpR3;
++
++    /*
++     * Init the static parts.
++     */
++    pThis->pDrvIns                   = pDrvIns;
++    pThis->hFileDevice               = NIL_RTFILE;
++    pThis->pszIfName                 = NULL;
++    pThis->pszBridge                 = NULL;
++    pThis->pszCtlPath                = NULL;
++    pThis->fAttached                 = false;
++    pThis->fDetachOnTerminate        = true;
++    pThis->hPipeWrite                = NIL_RTPIPE;
++    pThis->hPipeRead                 = NIL_RTPIPE;
++
++    /* IBase */
++    pDrvIns->IBase.pfnQueryInterface = drvLinuxBridgeQueryInterface;
++    /* INetwork */
++    pThis->INetworkUp.pfnBeginXmit          = drvLinuxBridgeNetworkUp_BeginXmit;
++    pThis->INetworkUp.pfnAllocBuf           = drvLinuxBridgeNetworkUp_AllocBuf;
++    pThis->INetworkUp.pfnFreeBuf            = drvLinuxBridgeNetworkUp_FreeBuf;
++    pThis->INetworkUp.pfnSendBuf            = drvLinuxBridgeNetworkUp_SendBuf;
++    pThis->INetworkUp.pfnEndXmit            = drvLinuxBridgeNetworkUp_EndXmit;
++    pThis->INetworkUp.pfnSetPromiscuousMode = drvLinuxBridgeNetworkUp_SetPromiscuousMode;
++    pThis->INetworkUp.pfnNotifyLinkChanged  = drvLinuxBridgeNetworkUp_NotifyLinkChanged;
++
++#ifdef VBOX_WITH_STATISTICS
++    PDMDrvHlpSTAMRegisterF(pDrvIns, &pThis->StatPktSent,       STAMTYPE_COUNTER, STAMVISIBILITY_ALWAYS, STAMUNIT_OCCURENCES,     "Number of sent packets.",     "/Drivers/LinuxBridge%d/Packets/Sent", pDrvIns->iInstance);
++    PDMDrvHlpSTAMRegisterF(pDrvIns, &pThis->StatPktSentBytes,  STAMTYPE_COUNTER, STAMVISIBILITY_ALWAYS, STAMUNIT_BYTES,          "Number of sent bytes.",       "/Drivers/LinuxBridge%d/Bytes/Sent", pDrvIns->iInstance);
++    PDMDrvHlpSTAMRegisterF(pDrvIns, &pThis->StatPktRecv,       STAMTYPE_COUNTER, STAMVISIBILITY_ALWAYS, STAMUNIT_OCCURENCES,     "Number of received packets.", "/Drivers/LinuxBridge%d/Packets/Received", pDrvIns->iInstance);
++    PDMDrvHlpSTAMRegisterF(pDrvIns, &pThis->StatPktRecvBytes,  STAMTYPE_COUNTER, STAMVISIBILITY_ALWAYS, STAMUNIT_BYTES,          "Number of received bytes.",   "/Drivers/LinuxBridge%d/Bytes/Received", pDrvIns->iInstance);
++    PDMDrvHlpSTAMRegisterF(pDrvIns, &pThis->StatTransmit,      STAMTYPE_PROFILE, STAMVISIBILITY_ALWAYS, STAMUNIT_TICKS_PER_CALL, "Profiling packet transmit.",  "/Drivers/LinuxBridge%d/Transmit", pDrvIns->iInstance);
++    PDMDrvHlpSTAMRegisterF(pDrvIns, &pThis->StatReceive,       STAMTYPE_PROFILEADV, STAMVISIBILITY_ALWAYS, STAMUNIT_TICKS_PER_CALL, "Profiling packet receive.", "/Drivers/LinuxBridge%d/Receive", pDrvIns->iInstance);
++#endif /* VBOX_WITH_STATISTICS */
++
++    /*
++     * Validate the config.
++     */
++    PDMDRV_VALIDATE_CONFIG_RETURN(pDrvIns, "Bridge"
++                                           "|IfName"
++                                           "|CtlPath"
++                                           "|DetachOnTerminate"
++                                           "|MAC",
++                                           "");
++
++    /*
++     * Check that no-one is attached to us.
++     */
++    AssertMsgReturn(PDMDrvHlpNoAttach(pDrvIns) == VERR_PDM_NO_ATTACHED_DRIVER,
++                    ("Configuration error: Not possible to attach anything to this driver!\n"),
++                    VERR_PDM_DRVINS_NO_ATTACH);
++
++    /*
++     * Query the network port interface.
++     */
++    pThis->pIAboveNet = PDMIBASE_QUERY_INTERFACE(pDrvIns->pUpBase, PDMINETWORKDOWN);
++    if (!pThis->pIAboveNet)
++        return PDMDRV_SET_ERROR(pDrvIns, VERR_PDM_MISSING_INTERFACE_ABOVE,
++                                N_("Configuration error: The above device/driver didn't export the network port interface"));
++
++    /*
++     * Read the configuration.
++     */
++    int rc = pHlp->pfnCFGMQueryStringAlloc(pCfg, "Bridge", &pThis->pszBridge);
++    if (RT_FAILURE(rc))
++        return PDMDRV_SET_ERROR(pDrvIns, rc,
++                                N_("Configuration error: required property \"Bridge\" (host bridge name, e.g. vboxbr0) is missing"));
++
++    char szDefaultIfName[IFNAMSIZ];
++    RTStrPrintf(szDefaultIfName, sizeof(szDefaultIfName), "vboxtap%u", pDrvIns->iInstance);
++    rc = pHlp->pfnCFGMQueryStringAllocDef(pCfg, "IfName", &pThis->pszIfName, szDefaultIfName);
++    if (RT_FAILURE(rc))
++        return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"IfName\""));
++    if (RTStrNCmp(pThis->pszIfName, RT_STR_TUPLE("vboxtap")) != 0)
++        return PDMDRV_SET_ERROR(pDrvIns, VERR_INVALID_NAME,
++                                N_("Configuration error: \"IfName\" must have the 'vboxtap' prefix (enforced by VBoxNetBrCtl)"));
++    if (RTStrNLen(pThis->pszIfName, IFNAMSIZ) >= IFNAMSIZ)
++        return PDMDRV_SET_ERROR(pDrvIns, VERR_INVALID_NAME,
++                                N_("Configuration error: \"IfName\" is too long (IFNAMSIZ-1 max)"));
++
++    rc = pHlp->pfnCFGMQueryStringAlloc(pCfg, "CtlPath", &pThis->pszCtlPath);
++    if (rc == VERR_CFGM_VALUE_NOT_FOUND)
++    {
++        pThis->pszCtlPath = NULL;
++        rc = VINF_SUCCESS;
++    }
++    else if (RT_FAILURE(rc))
++        return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"CtlPath\""));
++
++    rc = pHlp->pfnCFGMQueryBool(pCfg, "DetachOnTerminate", &pThis->fDetachOnTerminate);
++    if (rc == VERR_CFGM_VALUE_NOT_FOUND)
++        rc = VINF_SUCCESS;
++    else if (RT_FAILURE(rc))
++        return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"DetachOnTerminate\""));
++
++    /*
++     * Create the TAP device and attach it to the bridge.
++     */
++    rc = drvLinuxBridgeAttach(pThis);
++    if (RT_FAILURE(rc))
++        return rc;
++
++    /*
++     * Create the transmit lock, control pipe and async I/O thread.
++     */
++    rc = RTCritSectInit(&pThis->XmitLock);
++    AssertRCReturn(rc, rc);
++
++    rc = RTPipeCreate(&pThis->hPipeRead, &pThis->hPipeWrite, 0 /*fFlags*/);
++    AssertRCReturn(rc, rc);
++
++    rc = PDMDrvHlpThreadCreate(pDrvIns, &pThis->pThread, pThis, drvLinuxBridgeAsyncIoThread,
++                               drvLinuxBridgeAsyncIoWakeup, 128 * _1K, RTTHREADTYPE_IO, "LnxBrdg");
++    AssertRCReturn(rc, rc);
++
++    return rc;
++}
++
++
++/**
++ * The LinuxBridge driver registration record.
++ */
++const PDMDRVREG g_DrvLinuxBridge =
++{
++    /* u32Version */
++    PDM_DRVREG_VERSION,
++    /* szName */
++    "LinuxBridge",
++    /* szRCMod */
++    "",
++    /* szR0Mod */
++    "",
++    /* pszDescription */
++    "Linux TAP + host bridge network transport driver (driverless KVM backend)",
++    /* fFlags */
++    PDM_DRVREG_FLAGS_HOST_BITS_DEFAULT,
++    /* fClass. */
++    PDM_DRVREG_CLASS_NETWORK,
++    /* cMaxInstances */
++    ~0U,
++    /* cbInstance */
++    sizeof(DRVLINUXBRIDGE),
++    /* pfnConstruct */
++    drvLinuxBridgeConstruct,
++    /* pfnDestruct */
++    drvLinuxBridgeDestruct,
++    /* pfnRelocate */
++    NULL,
++    /* pfnIOCtl */
++    NULL,
++    /* pfnPowerOn */
++    NULL,
++    /* pfnReset */
++    NULL,
++    /* pfnSuspend */
++    NULL,
++    /* pfnResume */
++    NULL,
++    /* pfnAttach */
++    NULL,
++    /* pfnDetach */
++    NULL,
++    /* pfnPowerOff */
++    NULL,
++    /* pfnSoftReset */
++    NULL,
++    /* u32VersionEnd */
++    PDM_DRVREG_VERSION
++};
+diff --git a/src/VBox/Devices/build/VBoxDD.cpp b/src/VBox/Devices/build/VBoxDD.cpp
+index ed613ab3..b7c6c21b 100644
+--- a/src/VBox/Devices/build/VBoxDD.cpp
++++ b/src/VBox/Devices/build/VBoxDD.cpp
+@@ -335,6 +335,11 @@ extern "C" DECLEXPORT(int) VBoxDriversRegister(PCPDMDRVREGCB pCallbacks, uint32_
+     if (RT_FAILURE(rc))
+         return rc;
+ #endif
++#ifdef RT_OS_LINUX
++    rc = pCallbacks->pfnRegister(pCallbacks, &g_DrvLinuxBridge);
++    if (RT_FAILURE(rc))
++        return rc;
++#endif
+ #ifdef VBOX_WITH_UDPTUNNEL
+     rc = pCallbacks->pfnRegister(pCallbacks, &g_DrvUDPTunnel);
+     if (RT_FAILURE(rc))
+diff --git a/src/VBox/Devices/build/VBoxDD.h b/src/VBox/Devices/build/VBoxDD.h
+index 6bcf1c35..8b97eb05 100644
+--- a/src/VBox/Devices/build/VBoxDD.h
++++ b/src/VBox/Devices/build/VBoxDD.h
+@@ -132,6 +132,9 @@ extern const PDMDRVREG g_DrvISCSITransportTcp;
+ #if defined(RT_OS_LINUX) || defined(RT_OS_FREEBSD)
+ extern const PDMDRVREG g_DrvHostInterface;
+ #endif
++#ifdef RT_OS_LINUX
++extern const PDMDRVREG g_DrvLinuxBridge;
++#endif
+ #ifdef VBOX_WITH_UDPTUNNEL
+ extern const PDMDRVREG g_DrvUDPTunnel;
+ #endif
+diff --git a/src/VBox/HostDrivers/adpctl/Makefile.kmk b/src/VBox/HostDrivers/adpctl/Makefile.kmk
+index 8bd2c42d..8018541e 100644
+--- a/src/VBox/HostDrivers/adpctl/Makefile.kmk
++++ b/src/VBox/HostDrivers/adpctl/Makefile.kmk
+@@ -40,5 +40,16 @@ else
+ endif
+ VBoxNetAdpCtl_SOURCES   = VBoxNetAdpCtl.cpp
+ 
++# Setuid helper for the DrvLinuxBridge network driver: enslaves vboxtap*
++# interfaces to a host bridge via rtnetlink.  Linux only, as is the driver.
++if1of ($(KBUILD_TARGET), linux)
++ PROGRAMS                += VBoxNetBrCtl
++ # Always static: a setuid helper must be self-contained.  With a dynamic
++ # VBoxRT.so dependency, the RUNPATH=$ORIGin lookup is ignored by glibc for
++ # setuid binaries (AT_SECURE), so the helper could not find its runtime.
++ VBoxNetBrCtl_TEMPLATE   = VBoxR3Static
++ VBoxNetBrCtl_SOURCES     = VBoxNetBrCtl.cpp
++endif
++
+ include $(FILE_KBUILD_SUB_FOOTER)
+ 
+diff --git a/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp b/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+new file mode 100644
+index 00000000..652fbb9a
+--- /dev/null
++++ b/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+@@ -0,0 +1,316 @@
++/* $Id$ */
++/** @file
++ * Apps - VBoxNetBrCtl, setuid helper for attaching LinuxBridge TAP devices to a host bridge.
++ *
++ * This program deliberately implements its networking operations directly via
++ * rtnetlink instead of exec'ing /sbin/ip: a setuid binary must not depend on
++ * external tools, environment variables or the file system layout.
++ *
++ * The interface that may be enslaved is restricted to names starting with
++ * "vboxtap", so an unprivileged caller can only manipulate TAP devices it
++ * could create and open itself.  It cannot use this helper to attach arbitrary
++ * host interfaces (e.g. eth0) to a bridge for snooping.
++ */
++
++/*
++ * Copyright (C) 2026 guochao <local>
++ *
++ * This file is part of VirtualBox base platform packages, as
++ * available from https://www.virtualbox.org.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation, in version 3 of the
++ * License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <https://www.gnu.org/licenses>.
++ *
++ * SPDX-License-Identifier: GPL-3.0-only
++ */
++
++
++/*********************************************************************************************************************************
++*   Header Files                                                                                                                 *
++*********************************************************************************************************************************/
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <unistd.h>
++
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <net/if.h>
++#include <linux/netlink.h>
++#include <linux/rtnetlink.h>
++
++#include <iprt/errcore.h>
++#include <iprt/initterm.h>
++#include <iprt/message.h>
++
++
++/*********************************************************************************************************************************
++*   Defined Constants And Macros                                                                                                 *
++*********************************************************************************************************************************/
++/** Only interfaces with this name prefix may be (de)slaved by this helper. */
++#define VBOXNETBRCTL_TAP_PREFIX     "vboxtap"
++
++/** Max octets of netlink attribute payload we build. */
++#define VBOXNETBRCTL_BUFSZ          512
++
++
++/*********************************************************************************************************************************
++*   Internal Functions                                                                                                           *
++*********************************************************************************************************************************/
++static int usage(void)
++{
++    fprintf(stderr, "Usage: VBoxNetBrCtl attach <vboxtapX> <bridge>\n");
++    fprintf(stderr, "     | VBoxNetBrCtl detach <vboxtapX>\n");
++    return EXIT_FAILURE;
++}
++
++
++static bool isValidIfName(const char *pszName)
++{
++    size_t const cch = strlen(pszName);
++    if (cch == 0 || cch >= IFNAMSIZ)
++        return false;
++    for (size_t i = 0; i < cch; i++)
++    {
++        char const ch = pszName[i];
++        if (   !(ch >= 'a' && ch <= 'z')
++            && !(ch >= 'A' && ch <= 'Z')
++            && !(ch >= '0' && ch <= '9')
++            && ch != '.'
++            && ch != '_'
++            && ch != ':'
++            && ch != '-')
++            return false;
++    }
++    return true;
++}
++
++
++static int nlOpen(void)
++{
++    int const fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
++    if (fd < 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: socket(AF_NETLINK): %s\n", strerror(errno));
++        return -1;
++    }
++
++    struct sockaddr_nl sa;
++    memset(&sa, 0, sizeof(sa));
++    sa.nl_family = AF_NETLINK;
++    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: bind(netlink): %s\n", strerror(errno));
++        close(fd);
++        return -1;
++    }
++    return fd;
++}
++
++
++/** Send a request and wait for the ACK, returning 0 or -errno. */
++static int nlTalk(int fd, struct nlmsghdr *pNlh)
++{
++    struct sockaddr_nl saKernel;
++    memset(&saKernel, 0, sizeof(saKernel));
++    saKernel.nl_family = AF_NETLINK;
++
++    if (sendto(fd, pNlh, pNlh->nlmsg_len, 0, (struct sockaddr *)&saKernel, sizeof(saKernel)) < 0)
++        return -errno;
++
++    char achBuf[VBOXNETBRCTL_BUFSZ];
++    for (;;)
++    {
++        ssize_t cbRecv = recv(fd, achBuf, sizeof(achBuf), 0);
++        if (cbRecv < 0)
++        {
++            if (errno == EINTR)
++                continue;
++            return -errno;
++        }
++
++        for (struct nlmsghdr *pHdr = (struct nlmsghdr *)achBuf; NLMSG_OK(pHdr, cbRecv);
++             pHdr = NLMSG_NEXT(pHdr, cbRecv))
++        {
++            if (pHdr->nlmsg_type == NLMSG_ERROR)
++            {
++                struct nlmsgerr const *pErr = (struct nlmsgerr *)NLMSG_DATA(pHdr);
++                return pErr->error; /* 0 == ACK */
++            }
++        }
++    }
++}
++
++
++static int nlAddAttr(struct nlmsghdr *pNlh, size_t cbBuf, int iType, const void *pv, size_t cb)
++{
++    size_t const cbAttr = RTA_LENGTH(cb);
++    if (NLMSG_ALIGN(pNlh->nlmsg_len) + RTA_ALIGN(cbAttr) > cbBuf)
++        return -EMSGSIZE;
++
++    struct rtattr *pAttr = (struct rtattr *)((char *)pNlh + NLMSG_ALIGN(pNlh->nlmsg_len));
++    pAttr->rta_type = iType;
++    pAttr->rta_len  = (unsigned short)cbAttr;
++    memcpy(RTA_DATA(pAttr), pv, cb);
++    pNlh->nlmsg_len = (unsigned)(NLMSG_ALIGN(pNlh->nlmsg_len) + RTA_ALIGN(cbAttr));
++    return 0;
++}
++
++
++static int linkSetMaster(int fdNetlink, const char *pszIfName, unsigned uMasterIdx)
++{
++    int const iIfIdx = (int)if_nametoindex(pszIfName);
++    if (iIfIdx <= 0)
++        return -ENODEV;
++
++    struct
++    {
++        struct nlmsghdr     Nlh;
++        struct ifinfomsg    IfInfo;
++        char                achAttr[VBOXNETBRCTL_BUFSZ];
++    } Req;
++    memset(&Req, 0, sizeof(Req));
++    Req.Nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifinfomsg));
++    Req.Nlh.nlmsg_type  = RTM_NEWLINK;
++    Req.Nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
++    Req.IfInfo.ifi_family = AF_UNSPEC;
++    Req.IfInfo.ifi_index  = iIfIdx;
++
++    int rc = nlAddAttr(&Req.Nlh, sizeof(Req), IFLA_MASTER, &uMasterIdx, sizeof(uMasterIdx));
++    if (rc == 0)
++        rc = nlTalk(fdNetlink, &Req.Nlh);
++    return rc;
++}
++
++
++static int linkSetUpDown(int fdNetlink, const char *pszIfName, bool fUp)
++{
++    int const iIfIdx = (int)if_nametoindex(pszIfName);
++    if (iIfIdx <= 0)
++        return -ENODEV;
++
++    struct
++    {
++        struct nlmsghdr     Nlh;
++        struct ifinfomsg    IfInfo;
++    } Req;
++    memset(&Req, 0, sizeof(Req));
++    Req.Nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifinfomsg));
++    Req.Nlh.nlmsg_type  = RTM_NEWLINK;
++    Req.Nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
++    Req.IfInfo.ifi_family = AF_UNSPEC;
++    Req.IfInfo.ifi_index  = iIfIdx;
++    Req.IfInfo.ifi_change = IFF_UP;
++    Req.IfInfo.ifi_flags  = fUp ? IFF_UP : 0;
++
++    return nlTalk(fdNetlink, &Req.Nlh);
++}
++
++
++int main(int argc, char **argv)
++{
++    int rc = RTR3InitExe(argc, &argv, 0 /*fFlags*/);
++    if (RT_FAILURE(rc))
++        return RTMsgInitFailure(rc);
++
++    if (geteuid() != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: must be installed setuid root (chmod 4511)\n");
++        return EXIT_FAILURE;
++    }
++
++    if (argc != 3 && argc != 4)
++        return usage();
++
++    const char * const pszAction = argv[1];
++    const char * const pszIfName = argv[2];
++
++    if (strncmp(pszIfName, VBOXNETBRCTL_TAP_PREFIX, sizeof(VBOXNETBRCTL_TAP_PREFIX) - 1) != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: interface '%s' does not have the required '" VBOXNETBRCTL_TAP_PREFIX "' prefix\n",
++                pszIfName);
++        return EXIT_FAILURE;
++    }
++    if (!isValidIfName(pszIfName))
++    {
++        fprintf(stderr, "VBoxNetBrCtl: invalid interface name '%s'\n", pszIfName);
++        return EXIT_FAILURE;
++    }
++
++    bool fAttach;
++    if (strcmp(pszAction, "attach") == 0)
++    {
++        if (argc != 4)
++            return usage();
++        if (!isValidIfName(argv[3]))
++        {
++            fprintf(stderr, "VBoxNetBrCtl: invalid bridge name '%s'\n", argv[3]);
++            return EXIT_FAILURE;
++        }
++        fAttach = true;
++    }
++    else if (strcmp(pszAction, "detach") == 0)
++    {
++        if (argc != 3)
++            return usage();
++        fAttach = false;
++    }
++    else
++        return usage();
++
++    int const fdNetlink = nlOpen();
++    if (fdNetlink < 0)
++        return EXIT_FAILURE;
++
++    if (fAttach)
++    {
++        unsigned const uBridgeIdx = if_nametoindex(argv[3]);
++        if (uBridgeIdx == 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: bridge '%s' does not exist\n", argv[3]);
++            close(fdNetlink);
++            return EXIT_FAILURE;
++        }
++
++        rc = linkSetMaster(fdNetlink, pszIfName, uBridgeIdx);
++        if (rc != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: failed to enslave '%s' to '%s': %s\n",
++                    pszIfName, argv[3], strerror(-rc));
++            close(fdNetlink);
++            return EXIT_FAILURE;
++        }
++
++        rc = linkSetUpDown(fdNetlink, pszIfName, true /*fUp*/);
++        if (rc != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: failed to bring '%s' up: %s\n", pszIfName, strerror(-rc));
++            close(fdNetlink);
++            return EXIT_FAILURE;
++        }
++    }
++    else
++    {
++        /* Best effort: down + deslave. Errors are not fatal, the caller only
++           uses this for cleanup before the TAP fd is closed. */
++        rc  = linkSetUpDown(fdNetlink, pszIfName, false /*fUp*/);
++        rc |= linkSetMaster(fdNetlink, pszIfName, 0 /* detach */);
++        if (rc != 0)
++            fprintf(stderr, "VBoxNetBrCtl: warning: failed to fully detach '%s': %s\n",
++                    pszIfName, strerror(-rc));
++    }
++
++    close(fdNetlink);
++    return EXIT_SUCCESS;
++}
+diff --git a/src/VBox/Installer/linux/install.sh b/src/VBox/Installer/linux/install.sh
+index e9ca4f04..50ee4bc2 100644
+--- a/src/VBox/Installer/linux/install.sh
++++ b/src/VBox/Installer/linux/install.sh
+@@ -310,6 +310,7 @@ if [ "$ACTION" = "install" ]; then
+ 
+     # This binaries need to be suid root in any case, even if not hardened
+     test -e $INSTALLATION_DIR/VBoxNetAdpCtl && chmod 4511 $INSTALLATION_DIR/VBoxNetAdpCtl
++    test -e $INSTALLATION_DIR/VBoxNetBrCtl && chmod 4511 $INSTALLATION_DIR/VBoxNetBrCtl
+     test -e $INSTALLATION_DIR/VBoxVolInfo && chmod 4511 $INSTALLATION_DIR/VBoxVolInfo
+ 
+     # Make sure the .autoreg file exists and has the current date so that
+diff --git a/src/VBox/Installer/linux/vboxbr0-setup.sh b/src/VBox/Installer/linux/vboxbr0-setup.sh
+new file mode 100755
+index 00000000..5336b1be
+--- /dev/null
++++ b/src/VBox/Installer/linux/vboxbr0-setup.sh
+@@ -0,0 +1,79 @@
++#!/bin/sh
++# vboxbr0-setup.sh - Host-side one-time setup for the LinuxBridge network driver.
++#
++# Creates the "vboxbr0" bridge with a static IP and starts dnsmasq bound to it
++# only, so guests attached via the LinuxBridge driver get DHCP/optional DNS.
++# Requires root. Re-run with "down" to tear everything down.
++#
++# Usage:
++#   sudo vboxbr0-setup.sh [up|down]
++#
++# What it does (up):
++#   1. ip link add vboxbr0 type bridge        (if absent)
++#   2. ip addr add 192.168.56.1/24 dev vboxbr0
++#   3. ip link set vboxbr0 up
++#   4. starts a dedicated dnsmasq instance:
++#        - bound to vboxbr0 only (DHCP + DNS on the bridge subnet)
++#        - leases file kept under /run to stay stateless
++#
++# Internet access for guests (optional, host-side, not done here):
++#   sysctl -w net.ipv4.ip_forward=1
++#   iptables -t nat -A POSTROUTING -s 192.168.56.0/24 -j MASQUERADE
++
++BRIDGE="${VBOXBR0_NAME:-vboxbr0}"
++SUBNET="${VBOXBR0_SUBNET:-192.168.56.0/24}"
++GATEWAY="${VBOXBR0_GW:-192.168.56.1}"
++DHCP_START="${VBOXBR0_DHCP_START:-192.168.56.100}"
++DHCP_END="${VBOXBR0_DHCP_END:-192.168.56.200}"
++LEASES="/run/vboxbr0-dnsmasq.leases"
++PIDFILE="/run/vboxbr0-dnsmasq.pid"
++
++set -e
++
++case "$1" in
++    up|"")
++        if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
++            ip link add name "$BRIDGE" type bridge
++        fi
++        if ! ip addr show dev "$BRIDGE" | grep -q "$GATEWAY"; then
++            ip addr add "$GATEWAY/24" dev "$BRIDGE"
++        fi
++        ip link set "$BRIDGE" up
++
++        # Bridge ports (vboxtap*) are enslaved and brought up by
++        # VBoxNetBrCtl when a VM starts; nothing else to do here.
++
++        if ! command -v dnsmasq >/dev/null 2>&1; then
++            echo "dnsmasq not installed; bridge is up but guests get no DHCP." >&2
++            echo "Install dnsmasq or configure guest IPs statically." >&2
++            exit 0
++        fi
++        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
++            echo "dnsmasq already running for $BRIDGE (pid $(cat "$PIDFILE"))."
++            exit 0
++        fi
++        # port=0 would disable DNS; here DNS on the bridge is desired, so we
++        # keep it enabled but strictly interface-bound.
++        dnsmasq \
++            --bind-interfaces \
++            --interface="$BRIDGE" \
++            --dhcp-range="$DHCP_START,$DHCP_END,255.255.255.0,24h" \
++            --dhcp-option=3,"$GATEWAY" \
++            --dhcp-option=6,"$GATEWAY" \
++            --dhcp-leasefile="$LEASES" \
++            --pid-file="$PIDFILE" \
++            --except-interface=lo
++        echo "$BRIDGE up at $GATEWAY, dnsmasq serving $DHCP_START..$DHCP_END"
++        ;;
++
++    down)
++        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null || true
++        ip link del "$BRIDGE" 2>/dev/null || true
++        echo "$BRIDGE torn down."
++        ;;
++
++    *)
++        echo "Usage: $0 [up|down]" >&2
++        exit 1
++        ;;
++esac
+diff --git a/src/VBox/VMM/Makefile.kmk b/src/VBox/VMM/Makefile.kmk
+index b597d4d2..d49c06fa 100644
+--- a/src/VBox/VMM/Makefile.kmk
++++ b/src/VBox/VMM/Makefile.kmk
+@@ -941,7 +941,7 @@ VMMStatic_SOURCES.$(KBUILD_TARGET_ARCH) = \
+ VMMStatic_SOURCES.$(KBUILD_TARGET).$(KBUILD_TARGET_ARCH) = \
+ 	$(filter-out \
+ 		VMMR3/target-armv8/NEMR3Native-% \
+-		VMMR3/target-x86/NEMR3Native-% \
++		$(if-expr defined(VBOX_WITH_KVM),,VMMR3/target-x86/NEMR3Native-%) \
+ 		VMMR3/target-armv8/GICR3Nem-% \
+ 		VMMR3/target-x86/APICR3Nem-% \
+ 		, $($(VMMStatic_EXTENDS)_SOURCES.$(KBUILD_TARGET).$(KBUILD_TARGET_ARCH)))
+diff --git a/src/VBox/VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h b/src/VBox/VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h
+index 0c847eb7..dbd2cbae 100644
+--- a/src/VBox/VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h
++++ b/src/VBox/VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h
+@@ -833,13 +833,16 @@ VMMR3_INT_DECL(int) NEMR3NotifyPhysRamRegister(PVM pVM, RTGCPHYS GCPhys, RTGCPHY
+ }
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(bool) NEMR3IsMmio2DirtyPageTrackingSupported(PVM pVM)
+ {
+     RT_NOREF(pVM);
+     return true;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(int) NEMR3NotifyPhysMmioExMapEarly(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, uint32_t fFlags,
+                                                   void *pvRam, void *pvMmio2, uint8_t *pu2State, uint32_t *puNemRange)
+ {
+@@ -894,6 +897,7 @@ VMMR3_INT_DECL(int) NEMR3NotifyPhysMmioExMapEarly(PVM pVM, RTGCPHYS GCPhys, RTGC
+     *puNemRange = UINT32_MAX;
+     return VINF_SUCCESS;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ VMMR3_INT_DECL(int) NEMR3NotifyPhysMmioExMapLate(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, uint32_t fFlags,
+@@ -953,6 +957,7 @@ VMMR3_INT_DECL(int) NEMR3NotifyPhysMmioExUnmap(PVM pVM, RTGCPHYS GCPhys, RTGCPHY
+ }
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(int) NEMR3PhysMmio2QueryAndResetDirtyBitmap(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, uint32_t uNemRange,
+                                                            void *pvBitmap, size_t cbBitmap)
+ {
+@@ -972,6 +977,7 @@ VMMR3_INT_DECL(int) NEMR3PhysMmio2QueryAndResetDirtyBitmap(PVM pVM, RTGCPHYS GCP
+ 
+     return VINF_SUCCESS;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ VMMR3_INT_DECL(int)  NEMR3NotifyPhysRomRegisterEarly(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, void *pvPages, uint32_t fFlags,
+@@ -1045,12 +1051,14 @@ VMMR3_INT_DECL(int)  NEMR3NotifyPhysRomRegisterLate(PVM pVM, RTGCPHYS GCPhys, RT
+ }
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(void) NEMR3NotifySetA20(PVMCPU pVCpu, bool fEnabled)
+ {
+     Log(("nemR3NativeNotifySetA20: fEnabled=%RTbool\n", fEnabled));
+     Assert(VM_IS_NEM_ENABLED(pVCpu->CTX_SUFF(pVM)));
+     RT_NOREF(pVCpu, fEnabled);
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ VMM_INT_DECL(void) NEMHCNotifyHandlerPhysicalDeregister(PVMCC pVM, PGMPHYSHANDLERKIND enmKind, RTGCPHYS GCPhys, RTGCPHYS cb,
+diff --git a/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp b/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp
+index a98c83ad..cbf13e33 100644
+--- a/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp
++++ b/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp
+@@ -1408,11 +1408,13 @@ static int nemHCLnxImportState(PVMCPUCC pVCpu, uint64_t fWhat, PCPUMCTX pCtx, st
+  * @param   pVCpu       The cross context CPU structure.
+  * @param   fWhat       What to import, CPUMCTX_EXTRN_XXX.
+  */
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMM_INT_DECL(int) NEMImportStateOnDemand(PVMCPUCC pVCpu, uint64_t fWhat)
+ {
+     STAM_REL_COUNTER_INC(&pVCpu->nem.s.StatImportOnDemand);
+     return nemHCLnxImportState(pVCpu, fWhat, &pVCpu->cpum.GstCtx, pVCpu->nem.s.pRun);
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ /**
+@@ -1794,6 +1796,7 @@ static int nemHCLnxExportState(PVM pVM, PVMCPU pVCpu, PCPUMCTX pCtx, struct kvm_
+  * @param   pcTicks     Where to return the CPU tick count.
+  * @param   puAux       Where to return the TSC_AUX register value.
+  */
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMM_INT_DECL(int) NEMHCQueryCpuTick(PVMCPUCC pVCpu, uint64_t *pcTicks, uint32_t *puAux)
+ {
+     STAM_REL_COUNTER_INC(&pVCpu->nem.s.StatQueryCpuTick);
+@@ -1824,6 +1827,7 @@ VMM_INT_DECL(int) NEMHCQueryCpuTick(PVMCPUCC pVCpu, uint64_t *pcTicks, uint32_t
+ 
+     return VINF_SUCCESS;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ /**
+@@ -1836,6 +1840,7 @@ VMM_INT_DECL(int) NEMHCQueryCpuTick(PVMCPUCC pVCpu, uint64_t *pcTicks, uint32_t
+  * @param   pVCpu           The cross context CPU structure of the calling EMT.
+  * @param   uPausedTscValue The TSC value at the time of pausing.
+  */
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMM_INT_DECL(int) NEMHCResumeCpuTickOnAll(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uPausedTscValue)
+ {
+     RT_NOREF(pVCpu);
+@@ -1873,8 +1878,10 @@ VMM_INT_DECL(int) NEMHCResumeCpuTickOnAll(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uP
+ 
+     return VINF_SUCCESS;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMM_INT_DECL(uint32_t) NEMHCGetFeatures(PVMCC pVM)
+ {
+     RT_NOREF(pVM);
+@@ -1882,6 +1889,7 @@ VMM_INT_DECL(uint32_t) NEMHCGetFeatures(PVMCC pVM)
+          | NEM_FEAT_F_FULL_GST_EXEC
+          | NEM_FEAT_F_XSAVE_XRSTOR;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ 
+@@ -1890,6 +1898,7 @@ VMM_INT_DECL(uint32_t) NEMHCGetFeatures(PVMCC pVM)
+ *********************************************************************************************************************************/
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(bool) NEMR3CanExecuteGuest(PVM pVM, PVMCPU pVCpu)
+ {
+ #ifndef VBOX_WITH_KVM_IRQCHIP_FULL
+@@ -1910,6 +1919,7 @@ VMMR3_INT_DECL(bool) NEMR3CanExecuteGuest(PVM pVM, PVMCPU pVCpu)
+     return true;
+ #endif
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ DECLHIDDEN(bool) nemR3NativeSetSingleInstruction(PVM pVM, PVMCPU pVCpu, bool fEnable)
+@@ -2635,6 +2645,7 @@ static VBOXSTRICTRC nemHCLnxCheckAndInjectInterrupts(PVMCPUCC pVCpu)
+ #endif
+ }
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(VBOXSTRICTRC) NEMR3RunGC(PVM pVM, PVMCPU pVCpu)
+ {
+     Assert(VM_IS_NEM_ENABLED(pVM));
+@@ -2940,6 +2951,7 @@ VMMR3_INT_DECL(VBOXSTRICTRC) NEMR3RunGC(PVM pVM, PVMCPU pVCpu)
+              pVCpu->cpum.GstCtx.rflags.u, VBOXSTRICTRC_VAL(rcStrict) ));
+     return rcStrict;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ /** @page pg_nem_linux NEM/linux - Native Execution Manager, Linux.
+-- 
+2.54.0
+

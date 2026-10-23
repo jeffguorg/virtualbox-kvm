@@ -1,0 +1,399 @@
+From 2ea0234725ba16fb3ff2e33b578c7da86dd4ef93 Mon Sep 17 00:00:00 2001
+From: guochao <guochao@local>
+Date: Tue, 20 Oct 2026 23:03:52 +0800
+Subject: [PATCH 3/5] Main/GUI: first-class 'LinuxBridge' network attachment
+ type
+
+Adds NetworkAttachmentType_LinuxBridge (=9) as a presentation alias over
+the Generic + LinuxBridge driver storage form, so the attachment shows up
+as its own entry in the GUI 'Attached to' dropdown and in VBoxManage:
+
+  VBoxManage modifyvm <vm> --nic1 linuxbridge --nic-property1 bridge=vboxbr0
+
+Design: the .vbox XML stays untouched (still GenericInterface
+driver='LinuxBridge' + Property elements), so unpatched VirtualBox builds
+read and write these VMs without data loss, and no COM vtable changes are
+required - enums marshal as int32 and only an additive IDL const is added.
+
+- VirtualBox.xidl:        additive enum const LinuxBridge = 9
+- NetworkAdapterImpl:     get/setAttachmentType translate the alias
+                          (storage: Generic + strGenericDriver='LinuxBridge')
+- SystemPropertiesImpl:   advertise the type in
+                          getSupportedNetworkAttachmentTypes (Linux only);
+                          GUI dropdown is data-driven from this list
+- PlatformPropertiesImpl: s_getMaxNetworkAdaptersOfType handles the new type
+- ConsoleImplConfig:      LinuxBridge shares the Generic CFGM branch
+- VBoxManage:             '--nic1 linuxbridge' parsing and showvminfo output
+                          (nic1='LinuxBridge', linuxbridge1='<name>')
+- GUI: converter string, extra-data option bit, name combo becomes an
+  editable bridge-name field bound to the 'bridge' property, generic
+  properties editor stays available for advanced options, details view and
+  snapshot report render 'LinuxBridge <name>', attribute setter wired
+
+Verified end-to-end on the NutstoreEnterprise VM: XML round-trips in the
+storage form, showvminfo reports the new type, VM boots with vboxtap0
+enslaved to vboxbr0 (forwarding) and the guest receives its DHCP lease.
+---
+ .../Frontends/VBoxManage/VBoxManageInfo.cpp   | 14 ++++++++++
+ .../VBoxManage/VBoxManageModifyVM.cpp         |  8 ++++++
+ .../src/converter/UIConverterBackendCOM.cpp   |  1 +
+ .../src/extradata/UIExtraDataDefs.h           |  1 +
+ .../src/globals/UIDetailsGenerator.cpp        | 24 +++++++++++++++++
+ .../src/globals/UIMachineAttributeSetter.cpp  |  1 +
+ .../editors/UINetworkAttachmentEditor.cpp     | 12 ++++++++-
+ .../machine/UIMachineSettingsNetwork.cpp      | 23 ++++++++++++++--
+ .../src/snapshots/UISnapshotDetailsWidget.cpp |  4 +++
+ src/VBox/Main/idl/VirtualBox.xidl             |  3 +++
+ .../src-client/ConsoleImplConfigCommon.cpp    |  1 +
+ .../Main/src-server/NetworkAdapterImpl.cpp    | 26 +++++++++++++++++--
+ .../src-server/PlatformPropertiesImpl.cpp     |  1 +
+ .../Main/src-server/SystemPropertiesImpl.cpp  |  3 +++
+ 14 files changed, 117 insertions(+), 5 deletions(-)
+
+diff --git a/src/VBox/Frontends/VBoxManage/VBoxManageInfo.cpp b/src/VBox/Frontends/VBoxManage/VBoxManageInfo.cpp
+index 9c930800..cf91176e 100644
+--- a/src/VBox/Frontends/VBoxManage/VBoxManageInfo.cpp
++++ b/src/VBox/Frontends/VBoxManage/VBoxManageInfo.cpp
+@@ -1874,6 +1874,20 @@ HRESULT showVMInfo(ComPtr<IVirtualBox> pVirtualBox,
+                         break;
+                     }
+ 
++
++                    case NetworkAttachmentType_LinuxBridge:
++                    {
++                        Bstr strBridge;
++                        hrc = nic->GetProperty(Bstr("bridge").raw(), strBridge.asOutParam());
++                        if (details == VMINFO_MACHINEREADABLE)
++                        {
++                            RTPrintf("linuxbridge%d=\"%ls\"\n", currentNIC + 1, strBridge.raw());
++                            strAttachment = "LinuxBridge";
++                        }
++                        else
++                            strAttachment.printf(Info::tr("LinuxBridge '%ls'"), strBridge.raw());
++                        break;
++                    }
+                     case NetworkAttachmentType_NATNetwork:
+                     {
+                         Bstr strNetwork;
+diff --git a/src/VBox/Frontends/VBoxManage/VBoxManageModifyVM.cpp b/src/VBox/Frontends/VBoxManage/VBoxManageModifyVM.cpp
+index 4636d312..b68c9116 100644
+--- a/src/VBox/Frontends/VBoxManage/VBoxManageModifyVM.cpp
++++ b/src/VBox/Frontends/VBoxManage/VBoxManageModifyVM.cpp
+@@ -1938,6 +1938,14 @@ RTEXITCODE handleModifyVM(HandlerArg *a)
+                     CHECK_ERROR(nic, COMSETTER(AttachmentType)(NetworkAttachmentType_HostOnlyNetwork));
+                 }
+ #endif /* VBOX_WITH_VMNET */
++#ifdef RT_OS_LINUX
++                else if (!RTStrICmp(ValueUnion.psz, "linuxbridge"))
++                {
++                    if (!fEnabled)
++                        CHECK_ERROR(nic, COMSETTER(Enabled)(TRUE));
++                    CHECK_ERROR(nic, COMSETTER(AttachmentType)(NetworkAttachmentType_LinuxBridge));
++                }
++#endif /* RT_OS_LINUX */
+                 else if (!RTStrICmp(ValueUnion.psz, "generic"))
+                 {
+                     if (!fEnabled)
+diff --git a/src/VBox/Frontends/VirtualBox/src/converter/UIConverterBackendCOM.cpp b/src/VBox/Frontends/VirtualBox/src/converter/UIConverterBackendCOM.cpp
+index b9381f89..9cf41024 100644
+--- a/src/VBox/Frontends/VirtualBox/src/converter/UIConverterBackendCOM.cpp
++++ b/src/VBox/Frontends/VirtualBox/src/converter/UIConverterBackendCOM.cpp
+@@ -405,6 +405,7 @@ template<> SHARED_LIBRARY_STUFF QString UIConverter::toString(const KNetworkAtta
+ #endif /* VBOX_WITH_VMNET */
+         case KNetworkAttachmentType_Generic:         return QApplication::translate("UICommon", "Generic Driver", "NetworkAttachmentType");
+         case KNetworkAttachmentType_NATNetwork:      return QApplication::translate("UICommon", "NAT Network", "NetworkAttachmentType");
++        case KNetworkAttachmentType_LinuxBridge:     return QApplication::translate("UICommon", "LinuxBridge", "NetworkAttachmentType");
+ #ifdef VBOX_WITH_CLOUD_NET
+         case KNetworkAttachmentType_Cloud:           return QApplication::translate("UICommon", "Cloud Network [EXPERIMENTAL]", "NetworkAttachmentType");
+ #endif /* VBOX_WITH_CLOUD_NET */
+diff --git a/src/VBox/Frontends/VirtualBox/src/extradata/UIExtraDataDefs.h b/src/VBox/Frontends/VirtualBox/src/extradata/UIExtraDataDefs.h
+index 9cee433c..e9db0ba5 100644
+--- a/src/VBox/Frontends/VirtualBox/src/extradata/UIExtraDataDefs.h
++++ b/src/VBox/Frontends/VirtualBox/src/extradata/UIExtraDataDefs.h
+@@ -789,6 +789,7 @@ public:
+ #ifdef VBOX_WITH_VMNET
+         DetailsElementOptionTypeNetwork_HostOnlyNetwork = RT_BIT(8),
+ #endif /* VBOX_WITH_VMNET */
++        DetailsElementOptionTypeNetwork_LinuxBridge     = RT_BIT(9),
+         DetailsElementOptionTypeNetwork_Default         = 0xFFFF
+     };
+     Q_ENUM(DetailsElementOptionTypeNetwork);
+diff --git a/src/VBox/Frontends/VirtualBox/src/globals/UIDetailsGenerator.cpp b/src/VBox/Frontends/VirtualBox/src/globals/UIDetailsGenerator.cpp
+index 9b4aac60..90bee7a7 100644
+--- a/src/VBox/Frontends/VirtualBox/src/globals/UIDetailsGenerator.cpp
++++ b/src/VBox/Frontends/VirtualBox/src/globals/UIDetailsGenerator.cpp
+@@ -841,6 +841,30 @@ UITextTable UIDetailsGenerator::generateMachineInformationNetwork(CMachine &comM
+                 }
+                 break;
+             }
++            case KNetworkAttachmentType_LinuxBridge:
++            {
++                if (fOptions & UIExtraDataMetaDefs::DetailsElementOptionTypeNetwork_LinuxBridge)
++                {
++                    const QString strName = comAdapter.GetProperty("bridge");
++                    const QString strGenericDriverProperties(summarizeGenericProperties(comAdapter));
++                    strAttachmentType = strGenericDriverProperties.isNull()
++                                      ? strAttachmentTemplate
++                                            .arg(strAnchorType)
++                                            .arg(uSlot)
++                                            .arg((int)KNetworkAttachmentType_LinuxBridge)
++                                            .arg(strName)
++                                            .arg(QApplication::translate("UIDetails", "LinuxBridge, '%1'", "details (network)")
++                                                 .arg(strName))
++                                      : strAttachmentTemplate
++                                            .arg(strAnchorType)
++                                            .arg(uSlot)
++                                            .arg((int)KNetworkAttachmentType_LinuxBridge)
++                                            .arg(strName)
++                                            .arg(QApplication::translate("UIDetails", "LinuxBridge, '%1' { %2 }", "details (network)")
++                                                 .arg(strName, strGenericDriverProperties));
++                }
++                break;
++            }
+             case KNetworkAttachmentType_NATNetwork:
+             {
+                 if (fOptions & UIExtraDataMetaDefs::DetailsElementOptionTypeNetwork_NATNetwork)
+diff --git a/src/VBox/Frontends/VirtualBox/src/globals/UIMachineAttributeSetter.cpp b/src/VBox/Frontends/VirtualBox/src/globals/UIMachineAttributeSetter.cpp
+index d08e6331..24671d79 100644
+--- a/src/VBox/Frontends/VirtualBox/src/globals/UIMachineAttributeSetter.cpp
++++ b/src/VBox/Frontends/VirtualBox/src/globals/UIMachineAttributeSetter.cpp
+@@ -251,6 +251,7 @@ void UIMachineAttributeSetter::setMachineAttribute(const CMachine &comConstMachi
+                     case KNetworkAttachmentType_Internal: comAdapter.SetInternalNetwork(nad.m_strName); break;
+                     case KNetworkAttachmentType_HostOnly: comAdapter.SetHostOnlyInterface(nad.m_strName); break;
+                     case KNetworkAttachmentType_Generic: comAdapter.SetGenericDriver(nad.m_strName); break;
++                    case KNetworkAttachmentType_LinuxBridge: comAdapter.SetProperty("bridge", nad.m_strName); break;
+                     case KNetworkAttachmentType_NATNetwork: comAdapter.SetNATNetwork(nad.m_strName); break;
+ #ifdef VBOX_WITH_CLOUD_NET
+                     case KNetworkAttachmentType_Cloud: comAdapter.SetCloudNetwork(nad.m_strName); break;
+diff --git a/src/VBox/Frontends/VirtualBox/src/settings/editors/UINetworkAttachmentEditor.cpp b/src/VBox/Frontends/VirtualBox/src/settings/editors/UINetworkAttachmentEditor.cpp
+index 18b3e906..96b17b6b 100644
+--- a/src/VBox/Frontends/VirtualBox/src/settings/editors/UINetworkAttachmentEditor.cpp
++++ b/src/VBox/Frontends/VirtualBox/src/settings/editors/UINetworkAttachmentEditor.cpp
+@@ -240,7 +240,8 @@ void UINetworkAttachmentEditor::sltHandleCurrentTypeChanged()
+         m_pComboName->setEnabled(   valueType() != KNetworkAttachmentType_Null
+                                  && valueType() != KNetworkAttachmentType_NAT);
+         m_pComboName->setEditable(   valueType() == KNetworkAttachmentType_Internal
+-                                  || valueType() == KNetworkAttachmentType_Generic);
++                                  || valueType() == KNetworkAttachmentType_Generic
++                                  || valueType() == KNetworkAttachmentType_LinuxBridge);
+     }
+ 
+     /* Update name combo description: */
+@@ -458,6 +459,8 @@ void UINetworkAttachmentEditor::populateNameCombo()
+     const int iIndex = m_pComboName->findText(m_name.value(valueType()));
+     if (iIndex != -1)
+         m_pComboName->setCurrentIndex(iIndex);
++    else if (valueType() == KNetworkAttachmentType_LinuxBridge)
++        m_pComboName->setCurrentText(m_name.value(valueType()));
+ 
+     /* Handle combo item change: */
+     sltHandleCurrentNameChanged();
+@@ -490,6 +493,11 @@ void UINetworkAttachmentEditor::retranslateNameDescription()
+         case KNetworkAttachmentType_Generic:
+             m_pComboName->setToolTip(tr("Driver to be used with this network card"));
+             break;
++        case KNetworkAttachmentType_LinuxBridge:
++            m_pComboName->setToolTip(tr("Name of the host bridge (e.g. vboxbr0) that this network card "
++                                        "will be attached to. The bridge must exist on the host; use "
++                                        "vboxbr0-setup.sh to create it."));
++            break;
+         case KNetworkAttachmentType_NATNetwork:
+             m_pComboName->setToolTip(tr("Name of the NAT network that this network card "
+                                         "will be connected to. You can create and remove networks "
+@@ -528,6 +536,7 @@ void UINetworkAttachmentEditor::revalidate()
+         case KNetworkAttachmentType_HostOnly:
+         case KNetworkAttachmentType_Generic:
+         case KNetworkAttachmentType_NATNetwork:
++        case KNetworkAttachmentType_LinuxBridge:
+ #ifdef VBOX_WITH_CLOUD_NET
+         case KNetworkAttachmentType_Cloud:
+ #endif
+@@ -554,6 +563,7 @@ UIExtraDataMetaDefs::DetailsElementOptionTypeNetwork UINetworkAttachmentEditor::
+         case KNetworkAttachmentType_HostOnly:        return UIExtraDataMetaDefs::DetailsElementOptionTypeNetwork_HostOnlyAdapter;
+         case KNetworkAttachmentType_Generic:         return UIExtraDataMetaDefs::DetailsElementOptionTypeNetwork_GenericDriver;
+         case KNetworkAttachmentType_NATNetwork:      return UIExtraDataMetaDefs::DetailsElementOptionTypeNetwork_NATNetwork;
++        case KNetworkAttachmentType_LinuxBridge:     return UIExtraDataMetaDefs::DetailsElementOptionTypeNetwork_LinuxBridge;
+ #ifdef VBOX_WITH_CLOUD_NET
+         case KNetworkAttachmentType_Cloud:           return UIExtraDataMetaDefs::DetailsElementOptionTypeNetwork_CloudNetwork;
+ #endif
+diff --git a/src/VBox/Frontends/VirtualBox/src/settings/machine/UIMachineSettingsNetwork.cpp b/src/VBox/Frontends/VirtualBox/src/settings/machine/UIMachineSettingsNetwork.cpp
+index 97ea173e..bbe309a7 100644
+--- a/src/VBox/Frontends/VirtualBox/src/settings/machine/UIMachineSettingsNetwork.cpp
++++ b/src/VBox/Frontends/VirtualBox/src/settings/machine/UIMachineSettingsNetwork.cpp
+@@ -226,6 +226,9 @@ void UIMachineSettingsNetwork::loadToCacheFrom(QVariant &data)
+             oldAdapterData.m_strInternalNetworkName = wipedOutString(comAdapter.GetInternalNetwork());
+             oldAdapterData.m_strHostInterfaceName = wipedOutString(comAdapter.GetHostOnlyInterface());
+             oldAdapterData.m_strGenericDriverName = wipedOutString(comAdapter.GetGenericDriver());
++            /* LinuxBridge reuses the generic-driver name field to carry the host bridge name: */
++            if (oldAdapterData.m_attachmentType == KNetworkAttachmentType_LinuxBridge)
++                oldAdapterData.m_strGenericDriverName = wipedOutString(comAdapter.GetProperty("bridge"));
+             oldAdapterData.m_strNATNetworkName = wipedOutString(comAdapter.GetNATNetwork());
+ #ifdef VBOX_WITH_CLOUD_NET
+             oldAdapterData.m_strCloudNetworkName = wipedOutString(comAdapter.GetCloudNetwork());
+@@ -538,7 +541,8 @@ void UIMachineSettingsNetwork::polishTab(int iSlot)
+                                                && attachmentType(iSlot) != KNetworkAttachmentType_Generic
+                                                && attachmentType(iSlot) != KNetworkAttachmentType_NAT);
+     pTabEditor->setMACOptionsAvailable(isMachineOffline());
+-    pTabEditor->setGenericPropertiesAvailable(attachmentType(iSlot) == KNetworkAttachmentType_Generic);
++    pTabEditor->setGenericPropertiesAvailable(   attachmentType(iSlot) == KNetworkAttachmentType_Generic
++                                               || attachmentType(iSlot) == KNetworkAttachmentType_LinuxBridge);
+     pTabEditor->setCableOptionsAvailable(isMachineInValidMode());
+     pTabEditor->setForwardingOptionsAvailable(attachmentType(iSlot) == KNetworkAttachmentType_NAT);
+ }
+@@ -562,6 +566,7 @@ void UIMachineSettingsNetwork::getFromCache(int iSlot, const UISettingsCacheMach
+     pTabEditor->setValueName(KNetworkAttachmentType_Internal, wipedOutString(oldAdapterData.m_strInternalNetworkName));
+     pTabEditor->setValueName(KNetworkAttachmentType_HostOnly, wipedOutString(oldAdapterData.m_strHostInterfaceName));
+     pTabEditor->setValueName(KNetworkAttachmentType_Generic, wipedOutString(oldAdapterData.m_strGenericDriverName));
++    pTabEditor->setValueName(KNetworkAttachmentType_LinuxBridge, wipedOutString(oldAdapterData.m_strGenericDriverName));
+     pTabEditor->setValueName(KNetworkAttachmentType_NATNetwork, wipedOutString(oldAdapterData.m_strNATNetworkName));
+ #ifdef VBOX_WITH_CLOUD_NET
+     pTabEditor->setValueName(KNetworkAttachmentType_Cloud, wipedOutString(oldAdapterData.m_strCloudNetworkName));
+@@ -607,7 +612,10 @@ void UIMachineSettingsNetwork::putToCache(int iSlot, UISettingsCacheMachineNetwo
+     newAdapterData.m_strBridgedAdapterName = pTabEditor->valueName(KNetworkAttachmentType_Bridged);
+     newAdapterData.m_strInternalNetworkName = pTabEditor->valueName(KNetworkAttachmentType_Internal);
+     newAdapterData.m_strHostInterfaceName = pTabEditor->valueName(KNetworkAttachmentType_HostOnly);
+-    newAdapterData.m_strGenericDriverName = pTabEditor->valueName(KNetworkAttachmentType_Generic);
++    if (attachmentType(iSlot) == KNetworkAttachmentType_LinuxBridge)
++        newAdapterData.m_strGenericDriverName = pTabEditor->valueName(KNetworkAttachmentType_LinuxBridge);
++    else
++        newAdapterData.m_strGenericDriverName = pTabEditor->valueName(KNetworkAttachmentType_Generic);
+     newAdapterData.m_strNATNetworkName = pTabEditor->valueName(KNetworkAttachmentType_NATNetwork);
+ #ifdef VBOX_WITH_CLOUD_NET
+     newAdapterData.m_strCloudNetworkName = pTabEditor->valueName(KNetworkAttachmentType_Cloud);
+@@ -1055,6 +1063,17 @@ bool UIMachineSettingsNetwork::saveAdapterData(int iSlot)
+                         fSuccess = saveGenericProperties(comAdapter, newAdapterData.m_strGenericProperties);
+                     break;
+                 }
++                case KNetworkAttachmentType_LinuxBridge:
++                {
++                    if (fSuccess && newAdapterData.m_strGenericDriverName != oldAdapterData.m_strGenericDriverName)
++                    {
++                        comAdapter.SetProperty("bridge", newAdapterData.m_strGenericDriverName);
++                        fSuccess = comAdapter.isOk();
++                    }
++                    if (fSuccess && newAdapterData.m_strGenericProperties != oldAdapterData.m_strGenericProperties)
++                        fSuccess = saveGenericProperties(comAdapter, newAdapterData.m_strGenericProperties);
++                    break;
++                }
+                 case KNetworkAttachmentType_NATNetwork:
+                 {
+                     if (fSuccess && newAdapterData.m_strNATNetworkName != oldAdapterData.m_strNATNetworkName)
+diff --git a/src/VBox/Frontends/VirtualBox/src/snapshots/UISnapshotDetailsWidget.cpp b/src/VBox/Frontends/VirtualBox/src/snapshots/UISnapshotDetailsWidget.cpp
+index 0d77b576..2b4d1e08 100644
+--- a/src/VBox/Frontends/VirtualBox/src/snapshots/UISnapshotDetailsWidget.cpp
++++ b/src/VBox/Frontends/VirtualBox/src/snapshots/UISnapshotDetailsWidget.cpp
+@@ -2039,6 +2039,10 @@ QStringList UISnapshotDetailsWidget::networkReport(CMachine comMachine)
+                                                                                 .arg(comAdapter.GetGenericDriver(), strGenericDriverProperties)));
+                     break;
+                 }
++                case KNetworkAttachmentType_LinuxBridge:
++                    strInfo = strInfo.arg(QApplication::translate("UIDetails", "LinuxBridge, '%1'", "details (network)")
++                                                                  .arg(comAdapter.GetProperty("bridge")));
++                    break;
+                 case KNetworkAttachmentType_NATNetwork:
+                     strInfo = strInfo.arg(QApplication::translate("UIDetails", "NAT Network, '%1'", "details (network)")
+                                                                   .arg(comAdapter.GetNATNetwork()));
+diff --git a/src/VBox/Main/idl/VirtualBox.xidl b/src/VBox/Main/idl/VirtualBox.xidl
+index 3904a1f1..a785253a 100644
+--- a/src/VBox/Main/idl/VirtualBox.xidl
++++ b/src/VBox/Main/idl/VirtualBox.xidl
+@@ -22505,6 +22505,9 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
+     <const name="NATNetwork"            value="6"/>
+     <const name="Cloud"                 value="7"/>
+     <const name="HostOnlyNetwork"       value="8"/>
++    <const name="LinuxBridge"             value="9">
++      <desc>Linux TAP + host bridge via the LinuxBridge driver (driverless setups).  Stored as Generic attachment with the LinuxBridge driver.</desc>
++    </const>
+   </enum>
+ 
+   <enum
+diff --git a/src/VBox/Main/src-client/ConsoleImplConfigCommon.cpp b/src/VBox/Main/src-client/ConsoleImplConfigCommon.cpp
+index c7f1abcd..ec8a7186 100644
+--- a/src/VBox/Main/src-client/ConsoleImplConfigCommon.cpp
++++ b/src/VBox/Main/src-client/ConsoleImplConfigCommon.cpp
+@@ -3133,6 +3133,7 @@ int Console::i_configNetwork(const char *pszDevice,
+             }
+ 
+             case NetworkAttachmentType_Generic:
++            case NetworkAttachmentType_LinuxBridge:
+             {
+                 hrc = aNetworkAdapter->COMGETTER(GenericDriver)(bstr.asOutParam());         H();
+                 SafeArray<BSTR> names;
+diff --git a/src/VBox/Main/src-server/NetworkAdapterImpl.cpp b/src/VBox/Main/src-server/NetworkAdapterImpl.cpp
+index e9303824..8ca9f4c7 100644
+--- a/src/VBox/Main/src-server/NetworkAdapterImpl.cpp
++++ b/src/VBox/Main/src-server/NetworkAdapterImpl.cpp
+@@ -442,6 +442,13 @@ HRESULT NetworkAdapter::getAttachmentType(NetworkAttachmentType_T *aAttachmentTy
+     AutoReadLock alock(this COMMA_LOCKVAL_SRC_POS);
+ 
+     *aAttachmentType = mData->mode;
++#ifdef RT_OS_LINUX
++    /* The LinuxBridge attachment type is a presentation alias: it is stored
++     * as a Generic attachment using the LinuxBridge driver. */
++    if (   *aAttachmentType == NetworkAttachmentType_Generic
++        && mData->strGenericDriver == "LinuxBridge")
++        *aAttachmentType = NetworkAttachmentType_LinuxBridge;
++#endif
+ 
+     return S_OK;
+ }
+@@ -451,13 +458,28 @@ HRESULT NetworkAdapter::setAttachmentType(NetworkAttachmentType_T aAttachmentTyp
+     /* the machine needs to be mutable */
+     AutoMutableOrSavedOrRunningStateDependency adep(mParent);
+     if (FAILED(adep.hrc())) return adep.hrc();
+-
+     AutoWriteLock alock(this COMMA_LOCKVAL_SRC_POS);
++    bool fSetLinuxBridgeDriver = false;
++#ifdef RT_OS_LINUX
++    /* Translate the LinuxBridge presentation alias into its storage form:
++     * a Generic attachment using the LinuxBridge driver. */
++    if (aAttachmentType == NetworkAttachmentType_LinuxBridge)
++    {
++        aAttachmentType = NetworkAttachmentType_Generic;
++        fSetLinuxBridgeDriver = mData->strGenericDriver != "LinuxBridge";
++    }
++#endif
+ 
+-    if (mData->mode != aAttachmentType)
++    if (mData->mode != aAttachmentType || fSetLinuxBridgeDriver)
+     {
+         mData.backup();
+ 
++#ifdef RT_OS_LINUX
++        if (fSetLinuxBridgeDriver)
++            mData->strGenericDriver = "LinuxBridge";
++#endif
++
++
+         /* there must an internal network name */
+         if (mData->strInternalNetworkName.isEmpty())
+         {
+diff --git a/src/VBox/Main/src-server/PlatformPropertiesImpl.cpp b/src/VBox/Main/src-server/PlatformPropertiesImpl.cpp
+index e8221912..8aab3168 100644
+--- a/src/VBox/Main/src-server/PlatformPropertiesImpl.cpp
++++ b/src/VBox/Main/src-server/PlatformPropertiesImpl.cpp
+@@ -257,6 +257,7 @@ ULONG PlatformProperties::s_getMaxNetworkAdaptersOfType(ChipsetType_T aChipset,
+         case NetworkAttachmentType_NAT:
+         case NetworkAttachmentType_Internal:
+         case NetworkAttachmentType_NATNetwork:
++        case NetworkAttachmentType_LinuxBridge:
+             /* chipset default is OK */
+             break;
+         case NetworkAttachmentType_Bridged:
+diff --git a/src/VBox/Main/src-server/SystemPropertiesImpl.cpp b/src/VBox/Main/src-server/SystemPropertiesImpl.cpp
+index 81a71a22..338d4dd4 100644
+--- a/src/VBox/Main/src-server/SystemPropertiesImpl.cpp
++++ b/src/VBox/Main/src-server/SystemPropertiesImpl.cpp
+@@ -1348,6 +1348,9 @@ HRESULT SystemProperties::getSupportedNetworkAttachmentTypes(std::vector<Network
+         NetworkAttachmentType_NATNetwork,
+ #ifdef VBOX_WITH_CLOUD_NET
+         NetworkAttachmentType_Cloud,
++#endif
++#ifdef RT_OS_LINUX
++        NetworkAttachmentType_LinuxBridge,
+ #endif
+         NetworkAttachmentType_Null,
+     };
+-- 
+2.54.0
+

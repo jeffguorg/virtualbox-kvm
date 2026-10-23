@@ -1,0 +1,467 @@
+From e23d410a66530f8e3d0909294763e8bdfe4576ea Mon Sep 17 00:00:00 2001
+From: guochao <jeffguorg@gmail.com>
+Date: Fri, 23 Oct 2026 16:31:27 +0800
+Subject: [PATCH 4/5] VBoxNetBrCtl: add ensurebridge subcommand (create-only
+ bridge setup)
+
+Implements 'ensurebridge <vboxbr*> <cidr>' for one-shot host bridge
+setup at VM start:
+
+- Creates the bridge via RTM_NEWLINK (kind "bridge"), assigns the IPv4
+  address/netmask via ioctl and spawns an interface-bound dnsmasq with a
+  fixed .100-.200 DHCP range (same parameterization as vboxbr0-setup.sh).
+- Create-only policy: an already existing bridge is merely brought up and
+  left otherwise untouched.  Nothing is ever torn down; a host reboot
+  reclaims the setup.
+- Refuses to create the bridge when the requested CIDR overlaps any IPv4
+  address configured on any existing interface (full RTM_GETADDR dump);
+  the conflict is reported with the offending interface name and the
+  command fails.
+- The bridge name must carry the 'vboxbr' prefix; attaching to any
+  pre-existing bridge via 'attach' stays unrestricted.
+- EEXIST from a concurrent VM start is treated as success.
+---
+ src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp | 389 ++++++++++++++++++-
+ 1 file changed, 388 insertions(+), 1 deletion(-)
+
+diff --git a/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp b/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+index e9225e2c..4f3f64f5 100644
+--- a/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
++++ b/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+@@ -48,17 +48,22 @@
+ #include <sys/socket.h>
+ #include <sys/types.h>
+ #include <fcntl.h>
++#include <signal.h>
++
+ /* linux/if.h instead of glibc's <net/if.h>: the latter clashes with the
+  * kernel uapi headers we need (linux/if_tun.h pulls linux/if.h). */
+ #include <linux/if.h>
+ #include <linux/if_tun.h>
+ #include <linux/netlink.h>
+ #include <linux/rtnetlink.h>
++#include <linux/in.h>
+ 
++#include <iprt/asm.h>
+ #include <iprt/errcore.h>
+ #include <iprt/initterm.h>
+ #include <iprt/message.h>
+-
++#include <iprt/net.h>
++#include <iprt/string.h>
+ 
+ /*********************************************************************************************************************************
+ *   Defined Constants And Macros                                                                                                 *
+@@ -66,6 +71,13 @@
+ /** Only interfaces with this name prefix may be (de)slaved by this helper. */
+ #define VBOXNETBRCTL_TAP_PREFIX     "vboxtap"
+ 
++/** Prefix enforced for bridges "ensurebridge" may create (attaching to any
++ *  pre-existing bridge via "attach" is unrestricted). */
++#define VBOXNETBRCTL_BRIDGE_PREFIX  "vboxbr"
++
++/** CIDR suggested in error messages and used by the caller as default. */
++#define VBOXNETBRCTL_DEFAULT_CIDR   "192.168.56.1/24"
++
+ /** Max octets of netlink attribute payload we build. */
+ #define VBOXNETBRCTL_BUFSZ          512
+ 
+@@ -79,6 +91,7 @@ static int usage(void)
+     fprintf(stderr, "     | VBoxNetBrCtl detach <vboxtapX>\n");
+     fprintf(stderr, "     | VBoxNetBrCtl create <vboxtapX> <uid>\n");
+     fprintf(stderr, "     | VBoxNetBrCtl destroy <vboxtapX>\n");
++    fprintf(stderr, "     | VBoxNetBrCtl ensurebridge <vboxbrX> <cidr>\n");
+     return EXIT_FAILURE;
+ }
+ 
+@@ -291,6 +304,361 @@ static int linkSetUpDown(int fdNetlink, const char *pszIfName, bool fUp)
+ }
+ 
+ 
++/** Converts a prefix length (1..32) to a network byte order IPv4 netmask. */
++static RTNETADDRIPV4 prefixToMask(unsigned cPrefix)
++{
++    RTNETADDRIPV4 Mask;
++    Mask.u = RT_H2N_U32(cPrefix ? 0xffffffffU << (32 - cPrefix) : 0);
++    return Mask;
++}
++
++
++/** Formats an IPv4 address as dotted decimal.  The %RTipv4 strformat type is
++ *  not registered in this minimal tool, so do it by hand. */
++static void ipv4ToStr(RTNETADDRIPV4 Addr, char *pszBuf, size_t cbBuf)
++{
++    uint32_t const uHost = RT_N2H_U32(Addr.u);
++    snprintf(pszBuf, cbBuf, "%u.%u.%u.%u",
++             (uHost >> 24) & 0xff, (uHost >> 16) & 0xff, (uHost >> 8) & 0xff, uHost & 0xff);
++}
++
++
++/** Resolves an interface index to its name (if_indextoname() equivalent that
++ *  avoids <net/if.h>). Returns 0 on success, -errno on failure. */
++static int ifNameGet(unsigned uIdx, char *pszBuf, size_t cbBuf)
++{
++    int const fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0)
++        return -errno;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    IfReq.ifr_ifindex = (int)uIdx;
++    int const rc = ioctl(fd, SIOCGIFNAME, &IfReq) < 0 ? -errno : 0;
++    if (rc == 0)
++    {
++        snprintf(pszBuf, cbBuf, "%s", IfReq.ifr_name);
++        pszBuf[cbBuf - 1] = '\0';
++    }
++    close(fd);
++    return rc;
++}
++
++
++/** Parses "<ipv4>/<prefix>" into address and prefix length (8..30 so a
++ *  DHCP range fits the subnet).  The address is the requested interface
++ *  address, not necessarily the network base. */
++static int cidrParse(const char *pszCidr, RTNETADDRIPV4 *pAddr, RTNETADDRIPV4 *pMask, unsigned *pcPrefix)
++{
++    int iPrefix;
++    if (RTNetStrToIPv4Cidr(pszCidr, pAddr, &iPrefix) != VINF_SUCCESS)
++        return -EINVAL;
++    if (iPrefix < 8 || iPrefix > 30)
++        return -EINVAL;
++
++    *pcPrefix = (unsigned)iPrefix;
++    *pMask    = prefixToMask((unsigned)iPrefix);
++    return 0;
++}
++
++
++/** Checks whether the given network overlaps any IPv4 address assigned to any
++ *  existing interface.  Returns 0 when free, 1 on conflict (details printed),
++ *  -errno on enumeration failure (printed). */
++static int cidrConflicts(int fdNetlink, const char *pszCidr, RTNETADDRIPV4 Addr, RTNETADDRIPV4 Mask)
++{
++    struct
++    {
++        struct nlmsghdr     Nlh;
++        struct ifaddrmsg    IfAddr;
++    } Req;
++    memset(&Req, 0, sizeof(Req));
++    Req.Nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifaddrmsg));
++    Req.Nlh.nlmsg_type  = RTM_GETADDR;
++    Req.Nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
++    Req.IfAddr.ifa_family = AF_INET;
++
++    struct sockaddr_nl saKernel;
++    memset(&saKernel, 0, sizeof(saKernel));
++    saKernel.nl_family = AF_NETLINK;
++    if (sendto(fdNetlink, &Req.Nlh, Req.Nlh.nlmsg_len, 0, (struct sockaddr *)&saKernel, sizeof(saKernel)) < 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: RTM_GETADDR: %s\n", strerror(errno));
++        return -errno;
++    }
++
++    char achBuf[64 * 1024];
++    for (;;)
++    {
++        ssize_t cbRecv = recv(fdNetlink, achBuf, sizeof(achBuf), 0);
++        if (cbRecv < 0)
++        {
++            if (errno == EINTR)
++                continue;
++            fprintf(stderr, "VBoxNetBrCtl: RTM_GETADDR reply: %s\n", strerror(errno));
++            return -errno;
++        }
++
++        for (struct nlmsghdr *pHdr = (struct nlmsghdr *)achBuf; NLMSG_OK(pHdr, cbRecv);
++             pHdr = NLMSG_NEXT(pHdr, cbRecv))
++        {
++            if (pHdr->nlmsg_type == NLMSG_DONE)
++                return 0;
++            if (pHdr->nlmsg_type == NLMSG_ERROR)
++            {
++                struct nlmsgerr const *pErr = (struct nlmsgerr *)NLMSG_DATA(pHdr);
++                fprintf(stderr, "VBoxNetBrCtl: RTM_GETADDR error: %s\n", strerror(-pErr->error));
++                return pErr->error ? pErr->error : -EIO;
++            }
++            if (pHdr->nlmsg_type != RTM_NEWADDR)
++                continue;
++
++            struct ifaddrmsg const *pAddrMsg = (struct ifaddrmsg *)NLMSG_DATA(pHdr);
++            if (pAddrMsg->ifa_family != AF_INET)
++                continue;
++
++            RTNETADDRIPV4 OtherAddr;
++            bool fHaveAddr = false;
++            int cbAttrs = IFA_PAYLOAD(pHdr);
++            for (struct rtattr *pAttr = IFA_RTA(pAddrMsg); RTA_OK(pAttr, cbAttrs);
++                 pAttr = RTA_NEXT(pAttr, cbAttrs))
++            {
++                if ((pAttr->rta_type == IFA_LOCAL || pAttr->rta_type == IFA_ADDRESS)
++                    && RTA_PAYLOAD(pAttr) >= (int)sizeof(RTNETADDRIPV4))
++                {
++                    OtherAddr = *(RTNETADDRIPV4 *)RTA_DATA(pAttr);
++                    fHaveAddr = true;
++                    if (pAttr->rta_type == IFA_LOCAL)
++                        break;
++                }
++            }
++            if (!fHaveAddr)
++                continue;
++            RTNETADDRIPV4 const OtherMask = prefixToMask(pAddrMsg->ifa_prefixlen);
++            if ((Addr.u & OtherMask.u) == (OtherAddr.u & Mask.u))
++            {
++                char szIfName[IFNAMSIZ];
++                if (ifNameGet(pAddrMsg->ifa_index, szIfName, sizeof(szIfName)) != 0)
++                    snprintf(szIfName, sizeof(szIfName), "if%u", pAddrMsg->ifa_index);
++                char szOther[32];
++                ipv4ToStr(OtherAddr, szOther, sizeof(szOther));
++                fprintf(stderr, "VBoxNetBrCtl: CIDR '%s' overlaps with '%s' (%s/%u)\n",
++                        pszCidr, szIfName, szOther, pAddrMsg->ifa_prefixlen);
++                return 1;
++            }
++        }
++    }
++}
++
++
++/** Creates a bridge interface via RTM_NEWLINK (kind "bridge"). */
++static int bridgeCreate(int fdNetlink, const char *pszIfName)
++{
++    struct
++    {
++        struct nlmsghdr     Nlh;
++        struct ifinfomsg    IfInfo;
++        char                achAttr[VBOXNETBRCTL_BUFSZ];
++    } Req;
++    memset(&Req, 0, sizeof(Req));
++    Req.Nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifinfomsg));
++    Req.Nlh.nlmsg_type  = RTM_NEWLINK;
++    Req.Nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
++    Req.IfInfo.ifi_family = AF_UNSPEC;
++
++    int rc = nlAddAttr(&Req.Nlh, sizeof(Req), IFLA_IFNAME, pszIfName, strlen(pszIfName) + 1);
++    if (rc == 0)
++    {
++        size_t const offNest = NLMSG_ALIGN(Req.Nlh.nlmsg_len);
++        struct rtattr *pNest = (struct rtattr *)((char *)&Req + offNest);
++        pNest->rta_type = IFLA_LINKINFO;
++        pNest->rta_len  = RTA_LENGTH(0);
++        Req.Nlh.nlmsg_len = (unsigned)(offNest + RTA_ALIGN(RTA_LENGTH(0)));
++
++        rc = nlAddAttr(&Req.Nlh, sizeof(Req), IFLA_INFO_KIND, "bridge", sizeof("bridge"));
++        if (rc == 0)
++            pNest->rta_len = (unsigned short)(Req.Nlh.nlmsg_len - offNest);
++    }
++    if (rc == 0)
++        rc = nlTalk(fdNetlink, &Req.Nlh);
++    return rc;
++}
++
++
++/** Assigns an IPv4 address/netmask to an interface and brings it up
++ *  (SIOCSIFADDR/SIOCSIFNETMASK/SIOCSIFFLAGS via an AF_INET socket). */
++static int bridgeSetIpv4(const char *pszIfName, RTNETADDRIPV4 Addr, RTNETADDRIPV4 Mask)
++{
++    int const fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0)
++        return -errno;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    snprintf(IfReq.ifr_name, sizeof(IfReq.ifr_name), "%s", pszIfName);
++
++    struct sockaddr_in *pSin = (struct sockaddr_in *)&IfReq.ifr_addr;
++    pSin->sin_family = AF_INET;
++    memcpy(&pSin->sin_addr.s_addr, &Addr.u, sizeof(Addr.u));
++    int rc = ioctl(fd, SIOCSIFADDR, &IfReq) < 0 ? -errno : 0;
++    if (rc == 0)
++    {
++        memcpy(&pSin->sin_addr.s_addr, &Mask.u, sizeof(Mask.u));
++        rc = ioctl(fd, SIOCSIFNETMASK, &IfReq) < 0 ? -errno : 0;
++    }
++    if (rc == 0)
++    {
++        rc = ioctl(fd, SIOCGIFFLAGS, &IfReq) < 0 ? -errno : 0;
++        if (rc == 0)
++        {
++            IfReq.ifr_flags |= IFF_UP;
++            rc = ioctl(fd, SIOCSIFFLAGS, &IfReq) < 0 ? -errno : 0;
++        }
++    }
++    close(fd);
++    return rc;
++}
++
++
++/** Starts a dnsmasq instance bound to the bridge if none is running.
++ *  Best effort: failures are reported but not fatal (a bridge without DHCP
++ *  still serves statically configured guests).  Needs a prefix <= 24 so the
++ *  fixed ".100-.200" range fits the subnet; smaller subnets skip DHCP. */
++static void dnsmasqEnsure(const char *pszBridge, RTNETADDRIPV4 Addr, unsigned cPrefix)
++{
++    if (cPrefix > 24)
++        return;
++
++    char szPidFile[128];
++    char szLeaseFile[128];
++    char szIfArg[IFNAMSIZ + 16];
++    char szRangeArg[96];
++    char szOpt3Arg[64];
++    char szOpt6Arg[64];
++    char szLeaseArg[160];
++    char szPidArg[160];
++    char szGateway[32];
++    char szRangeLo[32];
++    char szRangeHi[32];
++    snprintf(szPidFile, sizeof(szPidFile), "/run/%s-dnsmasq.pid", pszBridge);
++    snprintf(szLeaseFile, sizeof(szLeaseFile), "/run/%s-dnsmasq.leases", pszBridge);
++
++    FILE *pFile = fopen(szPidFile, "r");
++    if (pFile)
++    {
++        long lPid = 0;
++        bool fAlive = fscanf(pFile, "%ld", &lPid) == 1 && lPid > 1 && kill((pid_t)lPid, 0) == 0;
++        fclose(pFile);
++        if (fAlive)
++            return;
++    }
++
++    uint32_t const uNet = RT_N2H_U32(Addr.u) & RT_N2H_U32(prefixToMask(cPrefix).u);
++    RTNETADDRIPV4 AddrLo;
++    RTNETADDRIPV4 AddrHi;
++    AddrLo.u = RT_H2N_U32(uNet + 100);
++    AddrHi.u = RT_H2N_U32(uNet + 200);
++    ipv4ToStr(Addr, szGateway, sizeof(szGateway));
++    ipv4ToStr(AddrLo, szRangeLo, sizeof(szRangeLo));
++    ipv4ToStr(AddrHi, szRangeHi, sizeof(szRangeHi));
++
++    snprintf(szIfArg, sizeof(szIfArg), "--interface=%s", pszBridge);
++    snprintf(szRangeArg, sizeof(szRangeArg), "--dhcp-range=%s,%s,255.255.255.0,24h", szRangeLo, szRangeHi);
++    snprintf(szOpt3Arg, sizeof(szOpt3Arg), "--dhcp-option=3,%s", szGateway);
++    snprintf(szOpt6Arg, sizeof(szOpt6Arg), "--dhcp-option=6,%s", szGateway);
++    snprintf(szLeaseArg, sizeof(szLeaseArg), "--dhcp-leasefile=%s", szLeaseFile);
++    snprintf(szPidArg, sizeof(szPidArg), "--pid-file=%s", szPidFile);
++
++    pid_t const pid = fork();
++    if (pid == 0)
++    {
++        setsid();
++        int const fdNull = open("/dev/null", O_RDWR);
++        if (fdNull >= 0)
++        {
++            dup2(fdNull, STDIN_FILENO);
++            dup2(fdNull, STDOUT_FILENO);
++            dup2(fdNull, STDERR_FILENO);
++        }
++        execlp("dnsmasq", "dnsmasq", "--bind-interfaces", szIfArg, szRangeArg,
++               szOpt3Arg, szOpt6Arg, szLeaseArg, szPidArg, "--except-interface=lo", (char *)NULL);
++        _exit(127);
++    }
++    if (pid < 0)
++        fprintf(stderr, "VBoxNetBrCtl: fork for dnsmasq failed: %s\n", strerror(errno));
++    /* The parent does not wait: dnsmasq daemonizes itself.  A concurrent VM
++       start racing us here makes the loser fail to bind and exit; the pid
++       file check on the next run sorts it out. */
++}
++
++
++/** Implements "ensurebridge <vboxbr*> <cidr>": create-only bridge setup at
++ *  VM start.  An already existing bridge is only brought up, never
++ *  reconfigured.  Exits with failure if the CIDR overlaps any existing
++ *  interface address. */
++static int doEnsureBridge(const char *pszBridge, const char *pszCidr)
++{
++    RTNETADDRIPV4 Addr;
++    RTNETADDRIPV4 Mask;
++    unsigned cPrefix;
++    int rc = cidrParse(pszCidr, &Addr, &Mask, &cPrefix);
++    if (rc != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: invalid CIDR '%s' (expected e.g. " VBOXNETBRCTL_DEFAULT_CIDR ")\n", pszCidr);
++        return EXIT_FAILURE;
++    }
++
++    int const fdNetlink = nlOpen();
++    if (fdNetlink < 0)
++        return EXIT_FAILURE;
++
++    if (ifIndexGet(pszBridge) != 0)
++    {
++        /* Create-only policy: leave addressing and DHCP of an existing
++           bridge (admin-managed or set up earlier) untouched. */
++        rc = linkSetUpDown(fdNetlink, pszBridge, true /*fUp*/);
++        if (rc == 0)
++            printf("VBoxNetBrCtl: bridge '%s' already exists, left as-is\n", pszBridge);
++        else
++            fprintf(stderr, "VBoxNetBrCtl: failed to bring '%s' up: %s\n", pszBridge, strerror(-rc));
++        close(fdNetlink);
++        return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
++    }
++
++    rc = cidrConflicts(fdNetlink, pszCidr, Addr, Mask);
++    if (rc != 0)
++    {
++        close(fdNetlink);
++        return EXIT_FAILURE;
++    }
++
++    rc = bridgeCreate(fdNetlink, pszBridge);
++    if (rc == -EEXIST)
++        rc = 0; /* Lost a race against a concurrent VM start. */
++    if (rc != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: failed to create bridge '%s': %s\n", pszBridge, strerror(-rc));
++        close(fdNetlink);
++        return EXIT_FAILURE;
++    }
++
++    rc = bridgeSetIpv4(pszBridge, Addr, Mask);
++    if (rc != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: failed to configure '%s' with '%s': %s\n",
++                pszBridge, pszCidr, strerror(-rc));
++        close(fdNetlink);
++        return EXIT_FAILURE;
++    }
++
++    dnsmasqEnsure(pszBridge, Addr, cPrefix);
++
++    printf("VBoxNetBrCtl: ensured bridge '%s' (%s)\n", pszBridge, pszCidr);
++    close(fdNetlink);
++    return EXIT_SUCCESS;
++}
++
++
+ int main(int argc, char **argv)
+ {
+     int rc = RTR3InitExe(argc, &argv, 0 /*fFlags*/);
+@@ -309,6 +677,25 @@ int main(int argc, char **argv)
+     const char * const pszAction = argv[1];
+     const char * const pszIfName = argv[2];
+ 
++
++    /* Bridge auto-setup at VM start: name and CIDR, no TAP restrictions. */
++    if (strcmp(pszAction, "ensurebridge") == 0)
++    {
++        if (argc != 4)
++            return usage();
++        if (strncmp(pszIfName, VBOXNETBRCTL_BRIDGE_PREFIX, sizeof(VBOXNETBRCTL_BRIDGE_PREFIX) - 1) != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: bridge '%s' does not have the required '" VBOXNETBRCTL_BRIDGE_PREFIX "' prefix\n",
++                    pszIfName);
++            return EXIT_FAILURE;
++        }
++        if (!isValidIfName(pszIfName))
++        {
++            fprintf(stderr, "VBoxNetBrCtl: invalid interface name '%s'\n", pszIfName);
++            return EXIT_FAILURE;
++        }
++        return doEnsureBridge(pszIfName, argv[3]);
++    }
+     if (strncmp(pszIfName, VBOXNETBRCTL_TAP_PREFIX, sizeof(VBOXNETBRCTL_TAP_PREFIX) - 1) != 0)
+     {
+         fprintf(stderr, "VBoxNetBrCtl: interface '%s' does not have the required '" VBOXNETBRCTL_TAP_PREFIX "' prefix\n",
+-- 
+2.54.0
+

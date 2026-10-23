@@ -1,0 +1,169 @@
+From f618473dd1856d0126bce936f3060e2173c56985 Mon Sep 17 00:00:00 2001
+From: guochao <jeffguorg@gmail.com>
+Date: Fri, 23 Oct 2026 16:31:27 +0800
+Subject: [PATCH 5/5] LinuxBridge: ensure host bridge exists at VM start
+ (ensure=true default)
+
+Before creating the TAP the driver now invokes
+'VBoxNetBrCtl ensurebridge <bridge> <cidr>' so the host bridge appears
+on demand instead of requiring a manual vboxbr0-setup run:
+
+- New optional properties: 'Ensure' (bool, default true) and 'Cidr'
+  (default 192.168.56.1/24), accepted case-insensitively like the
+  others.  Set Ensure=false for admin-managed bridges.
+- Helper stderr is captured into the VM error message, so CIDR overlap
+  and setuid problems surface directly in the VM startup failure.
+- The helper is resolved through the existing CtlPath/exe-dir logic.
+---
+ src/VBox/Devices/Network/DrvLinuxBridge.cpp | 121 +++++++++++++++++++-
+ 1 file changed, 120 insertions(+), 1 deletion(-)
+
+diff --git a/src/VBox/Devices/Network/DrvLinuxBridge.cpp b/src/VBox/Devices/Network/DrvLinuxBridge.cpp
+index 541a4d82..8cdb55aa 100644
+--- a/src/VBox/Devices/Network/DrvLinuxBridge.cpp
++++ b/src/VBox/Devices/Network/DrvLinuxBridge.cpp
+@@ -263,6 +263,89 @@ static int drvLinuxBridgeRunCtl2(PDRVLINUXBRIDGE pThis, const char *pszAction, c
+ }
+ 
+ 
++/**
++ * Runs "VBoxNetBrCtl <action> <arg1> <arg2>" and waits for it, capturing
++ * stderr into a caller buffer for error reporting.
++ *
++ * @returns VBox status code.
++ * @param   pThis       The instance data.
++ * @param   pszAction   The helper subcommand ("ensurebridge").
++ * @param   pszArg1     First argument (bridge name).
++ * @param   pszArg2     Second argument (CIDR), may be NULL.
++ * @param   pszDiag     Where to store captured stderr (always set).
++ * @param   cbDiag      Size of the diagnostics buffer.
++ */
++static int drvLinuxBridgeRunCtlCapture(PDRVLINUXBRIDGE pThis, const char *pszAction,
++                                       const char *pszArg1, const char *pszArg2,
++                                       char *pszDiag, size_t cbDiag)
++{
++    RTStrCopy(pszDiag, cbDiag, "no details");
++
++    char szCtl[RTPATH_MAX];
++    int rc = drvLinuxBridgeResolveCtlPath(pThis, szCtl, sizeof(szCtl));
++    if (RT_FAILURE(rc))
++    {
++        RTStrPrintf(pszDiag, cbDiag, "VBoxNetBrCtl helper not found (%Rrc)", rc);
++        return rc;
++    }
++
++    const char *apszArgs[5];
++    apszArgs[0] = szCtl;
++    apszArgs[1] = pszAction;
++    apszArgs[2] = pszArg1;
++    apszArgs[3] = pszArg2;
++    apszArgs[4] = NULL;
++
++    RTPIPE hPipeR = NIL_RTPIPE;
++    RTPIPE hPipeW = NIL_RTPIPE;
++    rc = RTPipeCreate(&hPipeR, &hPipeW, 0 /*fFlags*/);
++    AssertRCReturn(rc, rc);
++
++    RTHANDLE hStdErr;
++    hStdErr.enmType     = RTHANDLETYPE_PIPE;
++    hStdErr.u.hPipe     = hPipeW;
++
++    RTPROCESS hProc;
++    rc = RTProcCreateEx(szCtl, apszArgs, RTENV_DEFAULT, 0 /*fFlags*/,
++                        NULL /*phStdIn*/, NULL /*phStdOut*/, &hStdErr,
++                        NULL /*pszAsUser*/, NULL /*pszPassword*/, NULL /*pvExtraData*/, &hProc);
++    RTPipeClose(hPipeW);
++    if (RT_FAILURE(rc))
++    {
++        RTPipeClose(hPipeR);
++        RTStrPrintf(pszDiag, cbDiag, "failed to execute '%s'", szCtl);
++        return rc;
++    }
++
++    RTPROCSTATUS Status;
++    rc = RTProcWait(hProc, 0 /*fFlags*/, &Status);
++
++    /* The helper only ever prints a few hundred bytes, so draining after the
++       wait cannot deadlock. */
++    size_t off = 0;
++    for (;;)
++    {
++        size_t cbRead = 0;
++        int rc2 = RTPipeRead(hPipeR, &pszDiag[off], cbDiag - 1 - off, &cbRead);
++        if (RT_FAILURE(rc2) || cbRead == 0)
++            break;
++        off += cbRead;
++        if (off >= cbDiag - 1)
++            break;
++    }
++    RTPipeClose(hPipeR);
++    pszDiag[off] = '\0';
++    while (off > 0 && (pszDiag[off - 1] == '\n' || pszDiag[off - 1] == '\r'))
++        pszDiag[--off] = '\0';
++
++    if (RT_FAILURE(rc))
++        return rc;
++    if (Status.enmReason != RTPROCEXITREASON_NORMAL || Status.iStatus != 0)
++        return VERR_HOSTIF_INIT_FAILED;
++    return VINF_SUCCESS;
++}
++
++
+ /**
+  * Creates the TAP interface and attaches it to the host bridge.
+  *
+@@ -780,7 +863,7 @@ static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE p
+      * driver properties, so accept them in any case (CFGM itself compares
+      * strictly case-sensitively).
+      */
+-    static const char * const s_apszValidKeys[] = { "Bridge", "IfName", "CtlPath", "DetachOnTerminate", "MAC" };
++    static const char * const s_apszValidKeys[] = { "Bridge", "IfName", "CtlPath", "DetachOnTerminate", "Ensure", "Cidr", "MAC" };
+     for (PCFGMLEAF pLeaf = pHlp->pfnCFGMGetFirstValue(pCfg); pLeaf; pLeaf = pHlp->pfnCFGMGetNextValue(pLeaf))
+     {
+         char szName[64];
+@@ -856,6 +939,42 @@ static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE p
+             return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"DetachOnTerminate\""));
+     }
+ 
++    /*
++     * Ensure the host bridge exists (create-only, "ensurebridge" helper
++     * subcommand).  Enabled by default; the helper refuses CIDRs that
++     * overlap any existing interface address.
++     */
++    {
++        bool fEnsure = true;
++        char szEnsureKey[64];
++        if (drvLinuxBridgeFindKeyCI(pHlp, pCfg, "Ensure", szEnsureKey, sizeof(szEnsureKey)) == VINF_SUCCESS)
++        {
++            rc = pHlp->pfnCFGMQueryBool(pCfg, szEnsureKey, &fEnsure);
++            if (RT_FAILURE(rc))
++                return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"Ensure\""));
++        }
++        if (fEnsure)
++        {
++            char szCidr[32] = "192.168.56.1/24";
++            char szCidrKey[64];
++            if (drvLinuxBridgeFindKeyCI(pHlp, pCfg, "Cidr", szCidrKey, sizeof(szCidrKey)) == VINF_SUCCESS)
++            {
++                rc = pHlp->pfnCFGMQueryString(pCfg, szCidrKey, szCidr, sizeof(szCidr));
++                if (RT_FAILURE(rc))
++                    return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"Cidr\""));
++            }
++
++            char szDiag[512];
++            rc = drvLinuxBridgeRunCtlCapture(pThis, "ensurebridge", pThis->pszBridge, szCidr, szDiag, sizeof(szDiag));
++            if (RT_FAILURE(rc))
++                return PDMDrvHlpVMSetError(pDrvIns, rc, RT_SRC_POS,
++                                           N_("Failed to ensure host bridge '%s' (%s): %s"),
++                                           pThis->pszBridge, szCidr, szDiag);
++            LogRel(("LinuxBridge#%d: ensured host bridge '%s' (%s)\n",
++                    pDrvIns->iInstance, pThis->pszBridge, szCidr));
++        }
++    }
++
+     /*
+      * Create the TAP device and attach it to the bridge.
+      */
+-- 
+2.54.0
+
