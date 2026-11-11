@@ -1,0 +1,997 @@
+From d23c9f35950eadcd69a36d46f97b95c4393951ab Mon Sep 17 00:00:00 2001
+From: virtualbox-kvm-automation <virtualbox-kvm@localhost>
+Date: Wed, 11 Nov 2026 11:18:23 +0800
+Subject: [PATCH 4/5] LinuxBridge: helper and host integration
+
+---
+ src/VBox/HostDrivers/adpctl/Makefile.kmk     |  11 +
+ src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp | 842 +++++++++++++++++++
+ src/VBox/Installer/linux/install.sh          |   1 +
+ src/VBox/Installer/linux/vboxbr0-setup.sh    |  79 ++
+ src/VBox/Main/src-server/HostImpl.cpp        |   2 +-
+ 5 files changed, 934 insertions(+), 1 deletion(-)
+ create mode 100644 src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+ create mode 100755 src/VBox/Installer/linux/vboxbr0-setup.sh
+
+diff --git a/src/VBox/HostDrivers/adpctl/Makefile.kmk b/src/VBox/HostDrivers/adpctl/Makefile.kmk
+index 2d44c6a1..38e0339e 100644
+--- a/src/VBox/HostDrivers/adpctl/Makefile.kmk
++++ b/src/VBox/HostDrivers/adpctl/Makefile.kmk
+@@ -40,5 +40,16 @@ else
+ endif
+ VBoxNetAdpCtl_SOURCES   = VBoxNetAdpCtl.cpp
+ 
++# Setuid helper for the DrvLinuxBridge network driver: enslaves vboxtap*
++# interfaces to a host bridge via rtnetlink.  Linux only, as is the driver.
++if1of ($(KBUILD_TARGET), linux)
++ PROGRAMS                += VBoxNetBrCtl
++ # Always static: a setuid helper must be self-contained.  With a dynamic
++ # VBoxRT.so dependency, the RUNPATH=$ORIGin lookup is ignored by glibc for
++ # setuid binaries (AT_SECURE), so the helper could not find its runtime.
++ VBoxNetBrCtl_TEMPLATE   = VBoxR3Static
++ VBoxNetBrCtl_SOURCES     = VBoxNetBrCtl.cpp
++endif
++
+ include $(FILE_KBUILD_SUB_FOOTER)
+ 
+diff --git a/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp b/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+new file mode 100644
+index 00000000..dde7b62e
+--- /dev/null
++++ b/src/VBox/HostDrivers/adpctl/VBoxNetBrCtl.cpp
+@@ -0,0 +1,842 @@
++/* $Id$ */
++/** @file
++ * Apps - VBoxNetBrCtl, setuid helper for attaching LinuxBridge TAP devices to a host bridge.
++ *
++ * This program deliberately implements its networking operations directly via
++ * rtnetlink instead of exec'ing /sbin/ip: a setuid binary must not depend on
++ * external tools, environment variables or the file system layout.
++ *
++ * The interface that may be enslaved is restricted to names starting with
++ * "vboxtap", so an unprivileged caller can only manipulate TAP devices it
++ * could create and open itself.  It cannot use this helper to attach arbitrary
++ * host interfaces (e.g. eth0) to a bridge for snooping.
++ */
++
++/*
++ * Copyright (C) 2026 guochao <local>
++ *
++ * This file is part of VirtualBox base platform packages, as
++ * available from https://www.virtualbox.org.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation, in version 3 of the
++ * License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <https://www.gnu.org/licenses>.
++ *
++ * SPDX-License-Identifier: GPL-3.0-only
++ */
++
++
++/*********************************************************************************************************************************
++*   Header Files                                                                                                                 *
++*********************************************************************************************************************************/
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <unistd.h>
++
++#include <sys/ioctl.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <fcntl.h>
++#include <signal.h>
++
++/* linux/if.h instead of glibc's <net/if.h>: the latter clashes with the
++ * kernel uapi headers we need (linux/if_tun.h pulls linux/if.h). */
++#include <linux/if.h>
++#include <linux/if_tun.h>
++#include <linux/netlink.h>
++#include <linux/rtnetlink.h>
++#include <linux/in.h>
++
++#include <iprt/asm.h>
++#include <iprt/errcore.h>
++#include <iprt/initterm.h>
++#include <iprt/message.h>
++#include <iprt/net.h>
++#include <iprt/string.h>
++
++/*********************************************************************************************************************************
++*   Defined Constants And Macros                                                                                                 *
++*********************************************************************************************************************************/
++/** Only interfaces with this name prefix may be (de)slaved by this helper. */
++#define VBOXNETBRCTL_TAP_PREFIX     "vboxtap"
++
++/** Prefix enforced for bridges "ensurebridge" may create (attaching to any
++ *  pre-existing bridge via "attach" is unrestricted). */
++#define VBOXNETBRCTL_BRIDGE_PREFIX  "vboxbr"
++
++/** CIDR suggested in error messages and used by the caller as default. */
++#define VBOXNETBRCTL_DEFAULT_CIDR   "192.168.56.1/24"
++
++/** Max octets of netlink attribute payload we build. */
++#define VBOXNETBRCTL_BUFSZ          512
++
++
++/*********************************************************************************************************************************
++*   Internal Functions                                                                                                           *
++*********************************************************************************************************************************/
++static int usage(void)
++{
++    fprintf(stderr, "Usage: VBoxNetBrCtl attach <vboxtapX> <bridge>\n");
++    fprintf(stderr, "     | VBoxNetBrCtl detach <vboxtapX>\n");
++    fprintf(stderr, "     | VBoxNetBrCtl create <vboxtapX|vboxtap%%d> <uid>\n");
++    fprintf(stderr, "     | VBoxNetBrCtl destroy <vboxtapX>\n");
++    fprintf(stderr, "     | VBoxNetBrCtl ensurebridge <vboxbrX> <cidr>\n");
++    return EXIT_FAILURE;
++}
++
++
++static bool isValidIfName(const char *pszName, bool fAllowTemplate)
++{
++    size_t cch = strlen(pszName);
++    if (cch == 0 || cch >= IFNAMSIZ)
++        return false;
++    /* A "%d" unit template is accepted for create: the kernel substitutes the
++       first free index and tapCreate() reports the concrete name. */
++    if (fAllowTemplate && cch > 2 && pszName[cch - 2] == '%' && pszName[cch - 1] == 'd')
++        cch -= 2;
++    for (size_t i = 0; i < cch; i++)
++    {
++        char const ch = pszName[i];
++        if (   !(ch >= 'a' && ch <= 'z')
++            && !(ch >= 'A' && ch <= 'Z')
++            && !(ch >= '0' && ch <= '9')
++            && ch != '.'
++            && ch != '_'
++            && ch != ':'
++            && ch != '-')
++            return false;
++    }
++    return true;
++}
++
++
++static int nlOpen(void)
++{
++    int const fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
++    if (fd < 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: socket(AF_NETLINK): %s\n", strerror(errno));
++        return -1;
++    }
++
++    struct sockaddr_nl sa;
++    memset(&sa, 0, sizeof(sa));
++    sa.nl_family = AF_NETLINK;
++    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: bind(netlink): %s\n", strerror(errno));
++        close(fd);
++        return -1;
++    }
++    return fd;
++}
++
++
++/** Send a request and wait for the ACK, returning 0 or -errno. */
++static int nlTalk(int fd, struct nlmsghdr *pNlh)
++{
++    struct sockaddr_nl saKernel;
++    memset(&saKernel, 0, sizeof(saKernel));
++    saKernel.nl_family = AF_NETLINK;
++
++    if (sendto(fd, pNlh, pNlh->nlmsg_len, 0, (struct sockaddr *)&saKernel, sizeof(saKernel)) < 0)
++        return -errno;
++
++    char achBuf[VBOXNETBRCTL_BUFSZ];
++    for (;;)
++    {
++        ssize_t cbRecv = recv(fd, achBuf, sizeof(achBuf), 0);
++        if (cbRecv < 0)
++        {
++            if (errno == EINTR)
++                continue;
++            return -errno;
++        }
++
++        for (struct nlmsghdr *pHdr = (struct nlmsghdr *)achBuf; NLMSG_OK(pHdr, cbRecv);
++             pHdr = NLMSG_NEXT(pHdr, cbRecv))
++        {
++            if (pHdr->nlmsg_type == NLMSG_ERROR)
++            {
++                struct nlmsgerr const *pErr = (struct nlmsgerr *)NLMSG_DATA(pHdr);
++                return pErr->error; /* 0 == ACK */
++            }
++        }
++    }
++}
++
++
++static int nlAddAttr(struct nlmsghdr *pNlh, size_t cbBuf, int iType, const void *pv, size_t cb)
++{
++
++
++    size_t const cbAttr = RTA_LENGTH(cb);
++    if (NLMSG_ALIGN(pNlh->nlmsg_len) + RTA_ALIGN(cbAttr) > cbBuf)
++        return -EMSGSIZE;
++
++    struct rtattr *pAttr = (struct rtattr *)((char *)pNlh + NLMSG_ALIGN(pNlh->nlmsg_len));
++    pAttr->rta_type = iType;
++    pAttr->rta_len  = (unsigned short)cbAttr;
++    memcpy(RTA_DATA(pAttr), pv, cb);
++    pNlh->nlmsg_len = (unsigned)(NLMSG_ALIGN(pNlh->nlmsg_len) + RTA_ALIGN(cbAttr));
++    return 0;
++}
++/** if_nametoindex() equivalent via SIOCGIFINDEX (glibc's if_nametoindex
++ * lives in <net/if.h>, which we cannot include alongside the kernel uapi
++ * headers). Returns 0 if the name is unknown. */
++static unsigned ifIndexGet(const char *pszIfName)
++{
++    int const fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0)
++        return 0;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    snprintf(IfReq.ifr_name, sizeof(IfReq.ifr_name), "%s", pszIfName);
++    unsigned const uIdx = ioctl(fd, SIOCGIFINDEX, &IfReq) == 0 ? (unsigned)IfReq.ifr_ifindex : 0;
++    close(fd);
++    return uIdx;
++}
++
++
++/** Creates a persistent TAP interface owned by the given uid.  On success
++ *  the buffer receives the concrete interface name: the kernel substitutes
++ *  the unit number for a "%d" template in the requested name. */
++static int tapCreate(char *pszIfName, size_t cbIfName, uid_t uidOwner)
++{
++    int fd = open("/dev/net/tun", O_RDWR);
++    if (fd < 0)
++        return -errno;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    IfReq.ifr_flags = IFF_TAP | IFF_NO_PI;
++    snprintf(IfReq.ifr_name, sizeof(IfReq.ifr_name), "%s", pszIfName);
++
++    int rc;
++    if (ioctl(fd, TUNSETIFF, &IfReq) < 0)
++        rc = -errno;
++    else
++    {
++        snprintf(pszIfName, cbIfName, "%s", IfReq.ifr_name);
++        if (ioctl(fd, TUNSETPERSIST, 1) < 0)
++            rc = -errno;
++        else if (ioctl(fd, TUNSETOWNER, uidOwner) < 0)
++            rc = -errno;
++        else
++            rc = 0;
++    }
++    close(fd);
++    return rc;
++}
++
++
++/** Clears persistence of a TAP interface so it is removed on last close. */
++static int tapDestroy(const char *pszIfName)
++{
++    int fd = open("/dev/net/tun", O_RDWR);
++    if (fd < 0)
++        return -errno;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    snprintf(IfReq.ifr_name, sizeof(IfReq.ifr_name), "%s", pszIfName);
++    if (ioctl(fd, TUNSETIFF, &IfReq) < 0)
++    {
++        int const rc = -errno;
++        close(fd);
++        return rc;
++    }
++    int const rc = ioctl(fd, TUNSETPERSIST, 0) < 0 ? -errno : 0;
++    close(fd);
++    return rc;
++}
++
++
++static int linkSetMaster(int fdNetlink, const char *pszIfName, unsigned uMasterIdx)
++{
++    int const iIfIdx = (int)ifIndexGet(pszIfName);
++    if (iIfIdx <= 0)
++        return -ENODEV;
++
++    struct
++    {
++        struct nlmsghdr     Nlh;
++        struct ifinfomsg    IfInfo;
++        char                achAttr[VBOXNETBRCTL_BUFSZ];
++    } Req;
++    memset(&Req, 0, sizeof(Req));
++    Req.Nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifinfomsg));
++    Req.Nlh.nlmsg_type  = RTM_NEWLINK;
++    Req.Nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
++    Req.IfInfo.ifi_family = AF_UNSPEC;
++    Req.IfInfo.ifi_index  = iIfIdx;
++
++    int rc = nlAddAttr(&Req.Nlh, sizeof(Req), IFLA_MASTER, &uMasterIdx, sizeof(uMasterIdx));
++    if (rc == 0)
++        rc = nlTalk(fdNetlink, &Req.Nlh);
++    return rc;
++}
++
++
++static int linkSetUpDown(int fdNetlink, const char *pszIfName, bool fUp)
++{
++    int const iIfIdx = (int)ifIndexGet(pszIfName);
++    if (iIfIdx <= 0)
++        return -ENODEV;
++
++    struct
++    {
++        struct nlmsghdr     Nlh;
++        struct ifinfomsg    IfInfo;
++    } Req;
++    memset(&Req, 0, sizeof(Req));
++    Req.Nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifinfomsg));
++    Req.Nlh.nlmsg_type  = RTM_NEWLINK;
++    Req.Nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
++    Req.IfInfo.ifi_family = AF_UNSPEC;
++    Req.IfInfo.ifi_index  = iIfIdx;
++    Req.IfInfo.ifi_change = IFF_UP;
++    Req.IfInfo.ifi_flags  = fUp ? IFF_UP : 0;
++
++    return nlTalk(fdNetlink, &Req.Nlh);
++}
++
++
++/** Converts a prefix length (1..32) to a network byte order IPv4 netmask. */
++static RTNETADDRIPV4 prefixToMask(unsigned cPrefix)
++{
++    RTNETADDRIPV4 Mask;
++    Mask.u = RT_H2N_U32(cPrefix ? 0xffffffffU << (32 - cPrefix) : 0);
++    return Mask;
++}
++
++
++/** Formats an IPv4 address as dotted decimal.  The %RTipv4 strformat type is
++ *  not registered in this minimal tool, so do it by hand. */
++static void ipv4ToStr(RTNETADDRIPV4 Addr, char *pszBuf, size_t cbBuf)
++{
++    uint32_t const uHost = RT_N2H_U32(Addr.u);
++    snprintf(pszBuf, cbBuf, "%u.%u.%u.%u",
++             (uHost >> 24) & 0xff, (uHost >> 16) & 0xff, (uHost >> 8) & 0xff, uHost & 0xff);
++}
++
++
++/** Resolves an interface index to its name (if_indextoname() equivalent that
++ *  avoids <net/if.h>). Returns 0 on success, -errno on failure. */
++static int ifNameGet(unsigned uIdx, char *pszBuf, size_t cbBuf)
++{
++    int const fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0)
++        return -errno;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    IfReq.ifr_ifindex = (int)uIdx;
++    int const rc = ioctl(fd, SIOCGIFNAME, &IfReq) < 0 ? -errno : 0;
++    if (rc == 0)
++    {
++        snprintf(pszBuf, cbBuf, "%s", IfReq.ifr_name);
++        pszBuf[cbBuf - 1] = '\0';
++    }
++    close(fd);
++    return rc;
++}
++
++
++/** Parses "<ipv4>/<prefix>" into address and prefix length (8..30 so a
++ *  DHCP range fits the subnet).  The address is the requested interface
++ *  address, not necessarily the network base. */
++static int cidrParse(const char *pszCidr, RTNETADDRIPV4 *pAddr, RTNETADDRIPV4 *pMask, unsigned *pcPrefix)
++{
++    int iPrefix;
++    if (RTNetStrToIPv4Cidr(pszCidr, pAddr, &iPrefix) != VINF_SUCCESS)
++        return -EINVAL;
++    if (iPrefix < 8 || iPrefix > 30)
++        return -EINVAL;
++
++    *pcPrefix = (unsigned)iPrefix;
++    *pMask    = prefixToMask((unsigned)iPrefix);
++    return 0;
++}
++
++
++/** Checks whether the given network overlaps any IPv4 address assigned to any
++ *  existing interface.  Returns 0 when free, 1 on conflict (details printed),
++ *  -errno on enumeration failure (printed). */
++static int cidrConflicts(int fdNetlink, const char *pszCidr, RTNETADDRIPV4 Addr, RTNETADDRIPV4 Mask)
++{
++    struct
++    {
++        struct nlmsghdr     Nlh;
++        struct ifaddrmsg    IfAddr;
++    } Req;
++    memset(&Req, 0, sizeof(Req));
++    Req.Nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifaddrmsg));
++    Req.Nlh.nlmsg_type  = RTM_GETADDR;
++    Req.Nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
++    Req.IfAddr.ifa_family = AF_INET;
++
++    struct sockaddr_nl saKernel;
++    memset(&saKernel, 0, sizeof(saKernel));
++    saKernel.nl_family = AF_NETLINK;
++    if (sendto(fdNetlink, &Req.Nlh, Req.Nlh.nlmsg_len, 0, (struct sockaddr *)&saKernel, sizeof(saKernel)) < 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: RTM_GETADDR: %s\n", strerror(errno));
++        return -errno;
++    }
++
++    char achBuf[64 * 1024];
++    for (;;)
++    {
++        ssize_t cbRecv = recv(fdNetlink, achBuf, sizeof(achBuf), 0);
++        if (cbRecv < 0)
++        {
++            if (errno == EINTR)
++                continue;
++            fprintf(stderr, "VBoxNetBrCtl: RTM_GETADDR reply: %s\n", strerror(errno));
++            return -errno;
++        }
++
++        for (struct nlmsghdr *pHdr = (struct nlmsghdr *)achBuf; NLMSG_OK(pHdr, cbRecv);
++             pHdr = NLMSG_NEXT(pHdr, cbRecv))
++        {
++            if (pHdr->nlmsg_type == NLMSG_DONE)
++                return 0;
++            if (pHdr->nlmsg_type == NLMSG_ERROR)
++            {
++                struct nlmsgerr const *pErr = (struct nlmsgerr *)NLMSG_DATA(pHdr);
++                fprintf(stderr, "VBoxNetBrCtl: RTM_GETADDR error: %s\n", strerror(-pErr->error));
++                return pErr->error ? pErr->error : -EIO;
++            }
++            if (pHdr->nlmsg_type != RTM_NEWADDR)
++                continue;
++
++            struct ifaddrmsg const *pAddrMsg = (struct ifaddrmsg *)NLMSG_DATA(pHdr);
++            if (pAddrMsg->ifa_family != AF_INET)
++                continue;
++
++            RTNETADDRIPV4 OtherAddr;
++            bool fHaveAddr = false;
++            int cbAttrs = IFA_PAYLOAD(pHdr);
++            for (struct rtattr *pAttr = IFA_RTA(pAddrMsg); RTA_OK(pAttr, cbAttrs);
++                 pAttr = RTA_NEXT(pAttr, cbAttrs))
++            {
++                if ((pAttr->rta_type == IFA_LOCAL || pAttr->rta_type == IFA_ADDRESS)
++                    && RTA_PAYLOAD(pAttr) >= (int)sizeof(RTNETADDRIPV4))
++                {
++                    OtherAddr = *(RTNETADDRIPV4 *)RTA_DATA(pAttr);
++                    fHaveAddr = true;
++                    if (pAttr->rta_type == IFA_LOCAL)
++                        break;
++                }
++            }
++            if (!fHaveAddr)
++                continue;
++            RTNETADDRIPV4 const OtherMask = prefixToMask(pAddrMsg->ifa_prefixlen);
++            if ((Addr.u & OtherMask.u) == (OtherAddr.u & Mask.u))
++            {
++                char szIfName[IFNAMSIZ];
++                if (ifNameGet(pAddrMsg->ifa_index, szIfName, sizeof(szIfName)) != 0)
++                    snprintf(szIfName, sizeof(szIfName), "if%u", pAddrMsg->ifa_index);
++                char szOther[32];
++                ipv4ToStr(OtherAddr, szOther, sizeof(szOther));
++                fprintf(stderr, "VBoxNetBrCtl: CIDR '%s' overlaps with '%s' (%s/%u)\n",
++                        pszCidr, szIfName, szOther, pAddrMsg->ifa_prefixlen);
++                return 1;
++            }
++        }
++    }
++}
++
++
++/** Creates a bridge interface via RTM_NEWLINK (kind "bridge"). */
++static int bridgeCreate(int fdNetlink, const char *pszIfName)
++{
++    struct
++    {
++        struct nlmsghdr     Nlh;
++        struct ifinfomsg    IfInfo;
++        char                achAttr[VBOXNETBRCTL_BUFSZ];
++    } Req;
++    memset(&Req, 0, sizeof(Req));
++    Req.Nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifinfomsg));
++    Req.Nlh.nlmsg_type  = RTM_NEWLINK;
++    Req.Nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
++    Req.IfInfo.ifi_family = AF_UNSPEC;
++
++    int rc = nlAddAttr(&Req.Nlh, sizeof(Req), IFLA_IFNAME, pszIfName, strlen(pszIfName) + 1);
++    if (rc == 0)
++    {
++        size_t const offNest = NLMSG_ALIGN(Req.Nlh.nlmsg_len);
++        struct rtattr *pNest = (struct rtattr *)((char *)&Req + offNest);
++        pNest->rta_type = IFLA_LINKINFO;
++        pNest->rta_len  = RTA_LENGTH(0);
++        Req.Nlh.nlmsg_len = (unsigned)(offNest + RTA_ALIGN(RTA_LENGTH(0)));
++
++        rc = nlAddAttr(&Req.Nlh, sizeof(Req), IFLA_INFO_KIND, "bridge", sizeof("bridge"));
++        if (rc == 0)
++            pNest->rta_len = (unsigned short)(Req.Nlh.nlmsg_len - offNest);
++    }
++    if (rc == 0)
++        rc = nlTalk(fdNetlink, &Req.Nlh);
++    return rc;
++}
++
++
++/** Assigns an IPv4 address/netmask to an interface and brings it up
++ *  (SIOCSIFADDR/SIOCSIFNETMASK/SIOCSIFFLAGS via an AF_INET socket). */
++static int bridgeSetIpv4(const char *pszIfName, RTNETADDRIPV4 Addr, RTNETADDRIPV4 Mask)
++{
++    int const fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0)
++        return -errno;
++
++    struct ifreq IfReq;
++    memset(&IfReq, 0, sizeof(IfReq));
++    snprintf(IfReq.ifr_name, sizeof(IfReq.ifr_name), "%s", pszIfName);
++
++    struct sockaddr_in *pSin = (struct sockaddr_in *)&IfReq.ifr_addr;
++    pSin->sin_family = AF_INET;
++    memcpy(&pSin->sin_addr.s_addr, &Addr.u, sizeof(Addr.u));
++    int rc = ioctl(fd, SIOCSIFADDR, &IfReq) < 0 ? -errno : 0;
++    if (rc == 0)
++    {
++        memcpy(&pSin->sin_addr.s_addr, &Mask.u, sizeof(Mask.u));
++        rc = ioctl(fd, SIOCSIFNETMASK, &IfReq) < 0 ? -errno : 0;
++    }
++    if (rc == 0)
++    {
++        rc = ioctl(fd, SIOCGIFFLAGS, &IfReq) < 0 ? -errno : 0;
++        if (rc == 0)
++        {
++            IfReq.ifr_flags |= IFF_UP;
++            rc = ioctl(fd, SIOCSIFFLAGS, &IfReq) < 0 ? -errno : 0;
++        }
++    }
++    close(fd);
++    return rc;
++}
++
++
++/** Starts a dnsmasq instance bound to the bridge if none is running.
++ *  Best effort: failures are reported but not fatal (a bridge without DHCP
++ *  still serves statically configured guests).  Needs a prefix <= 24 so the
++ *  fixed ".100-.200" range fits the subnet; smaller subnets skip DHCP. */
++static void dnsmasqEnsure(const char *pszBridge, RTNETADDRIPV4 Addr, unsigned cPrefix)
++{
++    if (cPrefix > 24)
++        return;
++
++    char szPidFile[128];
++    char szLeaseFile[128];
++    char szIfArg[IFNAMSIZ + 16];
++    char szRangeArg[96];
++    char szOpt3Arg[64];
++    char szOpt6Arg[64];
++    char szLeaseArg[160];
++    char szPidArg[160];
++    char szGateway[32];
++    char szRangeLo[32];
++    char szRangeHi[32];
++    snprintf(szPidFile, sizeof(szPidFile), "/run/%s-dnsmasq.pid", pszBridge);
++    snprintf(szLeaseFile, sizeof(szLeaseFile), "/run/%s-dnsmasq.leases", pszBridge);
++
++    FILE *pFile = fopen(szPidFile, "r");
++    if (pFile)
++    {
++        long lPid = 0;
++        bool fAlive = fscanf(pFile, "%ld", &lPid) == 1 && lPid > 1 && kill((pid_t)lPid, 0) == 0;
++        fclose(pFile);
++        if (fAlive)
++            return;
++    }
++
++    uint32_t const uNet = RT_N2H_U32(Addr.u) & RT_N2H_U32(prefixToMask(cPrefix).u);
++    RTNETADDRIPV4 AddrLo;
++    RTNETADDRIPV4 AddrHi;
++    AddrLo.u = RT_H2N_U32(uNet + 100);
++    AddrHi.u = RT_H2N_U32(uNet + 200);
++    ipv4ToStr(Addr, szGateway, sizeof(szGateway));
++    ipv4ToStr(AddrLo, szRangeLo, sizeof(szRangeLo));
++    ipv4ToStr(AddrHi, szRangeHi, sizeof(szRangeHi));
++
++    snprintf(szIfArg, sizeof(szIfArg), "--interface=%s", pszBridge);
++    snprintf(szRangeArg, sizeof(szRangeArg), "--dhcp-range=%s,%s,255.255.255.0,24h", szRangeLo, szRangeHi);
++    snprintf(szOpt3Arg, sizeof(szOpt3Arg), "--dhcp-option=3,%s", szGateway);
++    snprintf(szOpt6Arg, sizeof(szOpt6Arg), "--dhcp-option=6,%s", szGateway);
++    snprintf(szLeaseArg, sizeof(szLeaseArg), "--dhcp-leasefile=%s", szLeaseFile);
++    snprintf(szPidArg, sizeof(szPidArg), "--pid-file=%s", szPidFile);
++
++    pid_t const pid = fork();
++    if (pid == 0)
++    {
++        setsid();
++        int const fdNull = open("/dev/null", O_RDWR);
++        if (fdNull >= 0)
++        {
++            dup2(fdNull, STDIN_FILENO);
++            dup2(fdNull, STDOUT_FILENO);
++            dup2(fdNull, STDERR_FILENO);
++        }
++        execlp("dnsmasq", "dnsmasq", "--bind-interfaces", szIfArg, szRangeArg,
++               szOpt3Arg, szOpt6Arg, szLeaseArg, szPidArg, "--except-interface=lo", (char *)NULL);
++        _exit(127);
++    }
++    if (pid < 0)
++        fprintf(stderr, "VBoxNetBrCtl: fork for dnsmasq failed: %s\n", strerror(errno));
++    /* The parent does not wait: dnsmasq daemonizes itself.  A concurrent VM
++       start racing us here makes the loser fail to bind and exit; the pid
++       file check on the next run sorts it out. */
++}
++
++
++/** Implements "ensurebridge <vboxbr*> <cidr>": create-only bridge setup at
++ *  VM start.  An already existing bridge is only brought up, never
++ *  reconfigured.  Exits with failure if the CIDR overlaps any existing
++ *  interface address. */
++static int doEnsureBridge(const char *pszBridge, const char *pszCidr)
++{
++    RTNETADDRIPV4 Addr;
++    RTNETADDRIPV4 Mask;
++    unsigned cPrefix;
++    int rc = cidrParse(pszCidr, &Addr, &Mask, &cPrefix);
++    if (rc != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: invalid CIDR '%s' (expected e.g. " VBOXNETBRCTL_DEFAULT_CIDR ")\n", pszCidr);
++        return EXIT_FAILURE;
++    }
++
++    int const fdNetlink = nlOpen();
++    if (fdNetlink < 0)
++        return EXIT_FAILURE;
++
++    if (ifIndexGet(pszBridge) != 0)
++    {
++        /* Create-only policy: leave addressing and DHCP of an existing
++           bridge (admin-managed or set up earlier) untouched. */
++        rc = linkSetUpDown(fdNetlink, pszBridge, true /*fUp*/);
++        if (rc == 0)
++            printf("VBoxNetBrCtl: bridge '%s' already exists, left as-is\n", pszBridge);
++        else
++            fprintf(stderr, "VBoxNetBrCtl: failed to bring '%s' up: %s\n", pszBridge, strerror(-rc));
++        close(fdNetlink);
++        return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
++    }
++
++    rc = cidrConflicts(fdNetlink, pszCidr, Addr, Mask);
++    if (rc != 0)
++    {
++        close(fdNetlink);
++        return EXIT_FAILURE;
++    }
++
++    rc = bridgeCreate(fdNetlink, pszBridge);
++    if (rc == -EEXIST)
++        rc = 0; /* Lost a race against a concurrent VM start. */
++    if (rc != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: failed to create bridge '%s': %s\n", pszBridge, strerror(-rc));
++        close(fdNetlink);
++        return EXIT_FAILURE;
++    }
++
++    rc = bridgeSetIpv4(pszBridge, Addr, Mask);
++    if (rc != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: failed to configure '%s' with '%s': %s\n",
++                pszBridge, pszCidr, strerror(-rc));
++        close(fdNetlink);
++        return EXIT_FAILURE;
++    }
++
++    dnsmasqEnsure(pszBridge, Addr, cPrefix);
++
++    printf("VBoxNetBrCtl: ensured bridge '%s' (%s)\n", pszBridge, pszCidr);
++    close(fdNetlink);
++    return EXIT_SUCCESS;
++}
++
++
++int main(int argc, char **argv)
++{
++    int rc = RTR3InitExe(argc, &argv, 0 /*fFlags*/);
++    if (RT_FAILURE(rc))
++        return RTMsgInitFailure(rc);
++
++    if (geteuid() != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: must be installed setuid root (chmod 4511)\n");
++        return EXIT_FAILURE;
++    }
++
++    if (argc != 3 && argc != 4)
++        return usage();
++
++    const char * const pszAction = argv[1];
++    const char * const pszIfName = argv[2];
++
++
++    /* Bridge auto-setup at VM start: name and CIDR, no TAP restrictions. */
++    if (strcmp(pszAction, "ensurebridge") == 0)
++    {
++        if (argc != 4)
++            return usage();
++        if (strncmp(pszIfName, VBOXNETBRCTL_BRIDGE_PREFIX, sizeof(VBOXNETBRCTL_BRIDGE_PREFIX) - 1) != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: bridge '%s' does not have the required '" VBOXNETBRCTL_BRIDGE_PREFIX "' prefix\n",
++                    pszIfName);
++            return EXIT_FAILURE;
++        }
++        if (!isValidIfName(pszIfName, false))
++        {
++            fprintf(stderr, "VBoxNetBrCtl: invalid interface name '%s'\n", pszIfName);
++            return EXIT_FAILURE;
++        }
++        return doEnsureBridge(pszIfName, argv[3]);
++    }
++    if (strncmp(pszIfName, VBOXNETBRCTL_TAP_PREFIX, sizeof(VBOXNETBRCTL_TAP_PREFIX) - 1) != 0)
++    {
++        fprintf(stderr, "VBoxNetBrCtl: interface '%s' does not have the required '" VBOXNETBRCTL_TAP_PREFIX "' prefix\n",
++                pszIfName);
++        return EXIT_FAILURE;
++    }
++
++    bool fAttach;
++    bool fCreate = false;
++    bool fDestroy = false;
++    uid_t uidOwner = 0;
++    if (strcmp(pszAction, "attach") == 0)
++    {
++        if (argc != 4)
++            return usage();
++        if (!isValidIfName(argv[3], false))
++        {
++            fprintf(stderr, "VBoxNetBrCtl: invalid bridge name '%s'\n", argv[3]);
++            return EXIT_FAILURE;
++        }
++        fAttach = true;
++    }
++    else if (strcmp(pszAction, "detach") == 0)
++    {
++        if (argc != 3)
++            return usage();
++        fAttach = false;
++    }
++    else if (strcmp(pszAction, "create") == 0)
++    {
++        if (argc != 4)
++            return usage();
++        char *pszEnd = NULL;
++        unsigned long const ulUid = strtoul(argv[3], &pszEnd, 10);
++        if (pszEnd == argv[3] || *pszEnd != '\0' || ulUid > 0xffffffffU)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: invalid uid '%s'\n", argv[3]);
++            return EXIT_FAILURE;
++        }
++        /* The TAP may only be handed to the calling user. */
++        if ((uid_t)ulUid != getuid())
++        {
++            fprintf(stderr, "VBoxNetBrCtl: uid '%s' does not match the calling user\n", argv[3]);
++            return EXIT_FAILURE;
++        }
++        uidOwner = (uid_t)ulUid;
++        fCreate = true;
++        fAttach = false;
++    }
++    else if (strcmp(pszAction, "destroy") == 0)
++    {
++        if (argc != 3)
++            return usage();
++        fDestroy = true;
++        fAttach = false;
++    }
++    else
++        return usage();
++
++    if (!isValidIfName(pszIfName, fCreate))
++    {
++        fprintf(stderr, "VBoxNetBrCtl: invalid interface name '%s'\n", pszIfName);
++        return EXIT_FAILURE;
++    }
++    if (fCreate)
++    {
++        char szActual[IFNAMSIZ];
++        snprintf(szActual, sizeof(szActual), "%s", pszIfName);
++        rc = tapCreate(szActual, sizeof(szActual), uidOwner);
++        if (rc != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: failed to create '%s': %s\n", pszIfName, strerror(-rc));
++            return EXIT_FAILURE;
++        }
++        /* Report the concrete name on stdout: for a "%d" template this is the
++           kernel-allocated name the caller must attach to. */
++        printf("%s\n", szActual);
++        return EXIT_SUCCESS;
++    }
++    if (fDestroy)
++    {
++        rc = tapDestroy(pszIfName);
++        if (rc != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: failed to destroy '%s': %s\n", pszIfName, strerror(-rc));
++            return EXIT_FAILURE;
++        }
++        return EXIT_SUCCESS;
++    }
++    int const fdNetlink = nlOpen();
++    if (fdNetlink < 0)
++        return EXIT_FAILURE;
++
++    if (fAttach)
++    {
++        unsigned const uBridgeIdx = ifIndexGet(argv[3]);
++        if (uBridgeIdx == 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: bridge '%s' does not exist\n", argv[3]);
++            close(fdNetlink);
++            return EXIT_FAILURE;
++        }
++
++        rc = linkSetMaster(fdNetlink, pszIfName, uBridgeIdx);
++        if (rc != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: failed to enslave '%s' to '%s': %s\n",
++                    pszIfName, argv[3], strerror(-rc));
++            close(fdNetlink);
++            return EXIT_FAILURE;
++        }
++
++        rc = linkSetUpDown(fdNetlink, pszIfName, true /*fUp*/);
++        if (rc != 0)
++        {
++            fprintf(stderr, "VBoxNetBrCtl: failed to bring '%s' up: %s\n", pszIfName, strerror(-rc));
++            close(fdNetlink);
++            return EXIT_FAILURE;
++        }
++    }
++    else
++    {
++        /* Best effort: down + deslave. Errors are not fatal, the caller only
++           uses this for cleanup before the TAP fd is closed. */
++        rc  = linkSetUpDown(fdNetlink, pszIfName, false /*fUp*/);
++        rc |= linkSetMaster(fdNetlink, pszIfName, 0 /* detach */);
++        if (rc != 0)
++            fprintf(stderr, "VBoxNetBrCtl: warning: failed to fully detach '%s': %s\n",
++                    pszIfName, strerror(-rc));
++    }
++
++    close(fdNetlink);
++    return EXIT_SUCCESS;
++}
+diff --git a/src/VBox/Installer/linux/install.sh b/src/VBox/Installer/linux/install.sh
+index e9ca4f04..50ee4bc2 100755
+--- a/src/VBox/Installer/linux/install.sh
++++ b/src/VBox/Installer/linux/install.sh
+@@ -310,6 +310,7 @@ if [ "$ACTION" = "install" ]; then
+ 
+     # This binaries need to be suid root in any case, even if not hardened
+     test -e $INSTALLATION_DIR/VBoxNetAdpCtl && chmod 4511 $INSTALLATION_DIR/VBoxNetAdpCtl
++    test -e $INSTALLATION_DIR/VBoxNetBrCtl && chmod 4511 $INSTALLATION_DIR/VBoxNetBrCtl
+     test -e $INSTALLATION_DIR/VBoxVolInfo && chmod 4511 $INSTALLATION_DIR/VBoxVolInfo
+ 
+     # Make sure the .autoreg file exists and has the current date so that
+diff --git a/src/VBox/Installer/linux/vboxbr0-setup.sh b/src/VBox/Installer/linux/vboxbr0-setup.sh
+new file mode 100755
+index 00000000..5336b1be
+--- /dev/null
++++ b/src/VBox/Installer/linux/vboxbr0-setup.sh
+@@ -0,0 +1,79 @@
++#!/bin/sh
++# vboxbr0-setup.sh - Host-side one-time setup for the LinuxBridge network driver.
++#
++# Creates the "vboxbr0" bridge with a static IP and starts dnsmasq bound to it
++# only, so guests attached via the LinuxBridge driver get DHCP/optional DNS.
++# Requires root. Re-run with "down" to tear everything down.
++#
++# Usage:
++#   sudo vboxbr0-setup.sh [up|down]
++#
++# What it does (up):
++#   1. ip link add vboxbr0 type bridge        (if absent)
++#   2. ip addr add 192.168.56.1/24 dev vboxbr0
++#   3. ip link set vboxbr0 up
++#   4. starts a dedicated dnsmasq instance:
++#        - bound to vboxbr0 only (DHCP + DNS on the bridge subnet)
++#        - leases file kept under /run to stay stateless
++#
++# Internet access for guests (optional, host-side, not done here):
++#   sysctl -w net.ipv4.ip_forward=1
++#   iptables -t nat -A POSTROUTING -s 192.168.56.0/24 -j MASQUERADE
++
++BRIDGE="${VBOXBR0_NAME:-vboxbr0}"
++SUBNET="${VBOXBR0_SUBNET:-192.168.56.0/24}"
++GATEWAY="${VBOXBR0_GW:-192.168.56.1}"
++DHCP_START="${VBOXBR0_DHCP_START:-192.168.56.100}"
++DHCP_END="${VBOXBR0_DHCP_END:-192.168.56.200}"
++LEASES="/run/vboxbr0-dnsmasq.leases"
++PIDFILE="/run/vboxbr0-dnsmasq.pid"
++
++set -e
++
++case "$1" in
++    up|"")
++        if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
++            ip link add name "$BRIDGE" type bridge
++        fi
++        if ! ip addr show dev "$BRIDGE" | grep -q "$GATEWAY"; then
++            ip addr add "$GATEWAY/24" dev "$BRIDGE"
++        fi
++        ip link set "$BRIDGE" up
++
++        # Bridge ports (vboxtap*) are enslaved and brought up by
++        # VBoxNetBrCtl when a VM starts; nothing else to do here.
++
++        if ! command -v dnsmasq >/dev/null 2>&1; then
++            echo "dnsmasq not installed; bridge is up but guests get no DHCP." >&2
++            echo "Install dnsmasq or configure guest IPs statically." >&2
++            exit 0
++        fi
++        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
++            echo "dnsmasq already running for $BRIDGE (pid $(cat "$PIDFILE"))."
++            exit 0
++        fi
++        # port=0 would disable DNS; here DNS on the bridge is desired, so we
++        # keep it enabled but strictly interface-bound.
++        dnsmasq \
++            --bind-interfaces \
++            --interface="$BRIDGE" \
++            --dhcp-range="$DHCP_START,$DHCP_END,255.255.255.0,24h" \
++            --dhcp-option=3,"$GATEWAY" \
++            --dhcp-option=6,"$GATEWAY" \
++            --dhcp-leasefile="$LEASES" \
++            --pid-file="$PIDFILE" \
++            --except-interface=lo
++        echo "$BRIDGE up at $GATEWAY, dnsmasq serving $DHCP_START..$DHCP_END"
++        ;;
++
++    down)
++        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null || true
++        ip link del "$BRIDGE" 2>/dev/null || true
++        echo "$BRIDGE torn down."
++        ;;
++
++    *)
++        echo "Usage: $0 [up|down]" >&2
++        exit 1
++        ;;
++esac
+diff --git a/src/VBox/Main/src-server/HostImpl.cpp b/src/VBox/Main/src-server/HostImpl.cpp
+index 255be110..6ef8236b 100644
+--- a/src/VBox/Main/src-server/HostImpl.cpp
++++ b/src/VBox/Main/src-server/HostImpl.cpp
+@@ -878,7 +878,7 @@ HRESULT Host::i_updatePersistentConfigForHostOnlyAdapters(void)
+  */
+ HRESULT Host::getNetworkInterfaces(std::vector<ComPtr<IHostNetworkInterface> > &aNetworkInterfaces)
+ {
+-#if defined(RT_OS_WINDOWS) || defined(VBOX_WITH_NETFLT) /*|| defined(RT_OS_OS2)*/
++#if defined(RT_OS_WINDOWS) || defined(VBOX_WITH_NETFLT) || defined(RT_OS_LINUX) /*|| defined(RT_OS_OS2)*/
+ # ifdef VBOX_WITH_HOSTNETIF_API
+     HRESULT hrc = i_updateNetIfList();
+     if (FAILED(hrc))
+-- 
+2.54.0
+

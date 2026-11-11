@@ -1,0 +1,180 @@
+From 4c52fea2e6e4cc8ee3f0e05855238531c0c8191d Mon Sep 17 00:00:00 2001
+From: virtualbox-kvm-automation <virtualbox-kvm@localhost>
+Date: Wed, 11 Nov 2026 11:18:23 +0800
+Subject: [PATCH 2/5] NEM: fix VMMStatic build
+
+---
+ src/VBox/VMM/Makefile.kmk                            |  2 +-
+ src/VBox/VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h   |  8 ++++++++
+ .../VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp   | 12 ++++++++++++
+ 3 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/VBox/VMM/Makefile.kmk b/src/VBox/VMM/Makefile.kmk
+index 65fd57bd..cd74af6f 100644
+--- a/src/VBox/VMM/Makefile.kmk
++++ b/src/VBox/VMM/Makefile.kmk
+@@ -941,7 +941,7 @@ VMMStatic_SOURCES.$(KBUILD_TARGET_ARCH) = \
+ VMMStatic_SOURCES.$(KBUILD_TARGET).$(KBUILD_TARGET_ARCH) = \
+ 	$(filter-out \
+ 		VMMR3/target-armv8/NEMR3Native-% \
+-		VMMR3/target-x86/NEMR3Native-% \
++		$(if-expr defined(VBOX_WITH_KVM),,VMMR3/target-x86/NEMR3Native-%) \
+ 		VMMR3/target-armv8/GICR3Nem-% \
+ 		VMMR3/target-x86/APICR3Nem-% \
+ 		, $($(VMMStatic_EXTENDS)_SOURCES.$(KBUILD_TARGET).$(KBUILD_TARGET_ARCH)))
+diff --git a/src/VBox/VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h b/src/VBox/VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h
+index 8b39a830..60ae3469 100644
+--- a/src/VBox/VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h
++++ b/src/VBox/VMM/VMMR3/NEMR3NativeTemplate-linux.cpp.h
+@@ -833,13 +833,16 @@ VMMR3_INT_DECL(int) NEMR3NotifyPhysRamRegister(PVM pVM, RTGCPHYS GCPhys, RTGCPHY
+ }
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(bool) NEMR3IsMmio2DirtyPageTrackingSupported(PVM pVM)
+ {
+     RT_NOREF(pVM);
+     return true;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(int) NEMR3NotifyPhysMmioExMapEarly(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, uint32_t fFlags,
+                                                   void *pvRam, void *pvMmio2, uint8_t *pu2State, uint32_t *puNemRange)
+ {
+@@ -894,6 +897,7 @@ VMMR3_INT_DECL(int) NEMR3NotifyPhysMmioExMapEarly(PVM pVM, RTGCPHYS GCPhys, RTGC
+     *puNemRange = UINT32_MAX;
+     return VINF_SUCCESS;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ VMMR3_INT_DECL(int) NEMR3NotifyPhysMmioExMapLate(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, uint32_t fFlags,
+@@ -953,6 +957,7 @@ VMMR3_INT_DECL(int) NEMR3NotifyPhysMmioExUnmap(PVM pVM, RTGCPHYS GCPhys, RTGCPHY
+ }
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(int) NEMR3PhysMmio2QueryAndResetDirtyBitmap(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, uint32_t uNemRange,
+                                                            void *pvBitmap, size_t cbBitmap)
+ {
+@@ -972,6 +977,7 @@ VMMR3_INT_DECL(int) NEMR3PhysMmio2QueryAndResetDirtyBitmap(PVM pVM, RTGCPHYS GCP
+ 
+     return VINF_SUCCESS;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ VMMR3_INT_DECL(int)  NEMR3NotifyPhysRomRegisterEarly(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, void *pvPages, uint32_t fFlags,
+@@ -1045,12 +1051,14 @@ VMMR3_INT_DECL(int)  NEMR3NotifyPhysRomRegisterLate(PVM pVM, RTGCPHYS GCPhys, RT
+ }
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(void) NEMR3NotifySetA20(PVMCPU pVCpu, bool fEnabled)
+ {
+     Log(("nemR3NativeNotifySetA20: fEnabled=%RTbool\n", fEnabled));
+     Assert(VM_IS_NEM_ENABLED(pVCpu->CTX_SUFF(pVM)));
+     RT_NOREF(pVCpu, fEnabled);
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ VMM_INT_DECL(void) NEMHCNotifyHandlerPhysicalDeregister(PVMCC pVM, PGMPHYSHANDLERKIND enmKind, RTGCPHYS GCPhys, RTGCPHYS cb,
+diff --git a/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp b/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp
+index 60bb627d..3465d736 100644
+--- a/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp
++++ b/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp
+@@ -1408,11 +1408,13 @@ static int nemHCLnxImportState(PVMCPUCC pVCpu, uint64_t fWhat, PCPUMCTX pCtx, st
+  * @param   pVCpu       The cross context CPU structure.
+  * @param   fWhat       What to import, CPUMCTX_EXTRN_XXX.
+  */
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMM_INT_DECL(int) NEMImportStateOnDemand(PVMCPUCC pVCpu, uint64_t fWhat)
+ {
+     STAM_REL_COUNTER_INC(&pVCpu->nem.s.StatImportOnDemand);
+     return nemHCLnxImportState(pVCpu, fWhat, &pVCpu->cpum.GstCtx, pVCpu->nem.s.pRun);
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ /**
+@@ -1794,6 +1796,7 @@ static int nemHCLnxExportState(PVM pVM, PVMCPU pVCpu, PCPUMCTX pCtx, struct kvm_
+  * @param   pcTicks     Where to return the CPU tick count.
+  * @param   puAux       Where to return the TSC_AUX register value.
+  */
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMM_INT_DECL(int) NEMHCQueryCpuTick(PVMCPUCC pVCpu, uint64_t *pcTicks, uint32_t *puAux)
+ {
+     STAM_REL_COUNTER_INC(&pVCpu->nem.s.StatQueryCpuTick);
+@@ -1824,6 +1827,7 @@ VMM_INT_DECL(int) NEMHCQueryCpuTick(PVMCPUCC pVCpu, uint64_t *pcTicks, uint32_t
+ 
+     return VINF_SUCCESS;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ /**
+@@ -1836,6 +1840,7 @@ VMM_INT_DECL(int) NEMHCQueryCpuTick(PVMCPUCC pVCpu, uint64_t *pcTicks, uint32_t
+  * @param   pVCpu           The cross context CPU structure of the calling EMT.
+  * @param   uPausedTscValue The TSC value at the time of pausing.
+  */
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMM_INT_DECL(int) NEMHCResumeCpuTickOnAll(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uPausedTscValue)
+ {
+     RT_NOREF(pVCpu);
+@@ -1873,8 +1878,10 @@ VMM_INT_DECL(int) NEMHCResumeCpuTickOnAll(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uP
+ 
+     return VINF_SUCCESS;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMM_INT_DECL(uint32_t) NEMHCGetFeatures(PVMCC pVM)
+ {
+     RT_NOREF(pVM);
+@@ -1882,6 +1889,7 @@ VMM_INT_DECL(uint32_t) NEMHCGetFeatures(PVMCC pVM)
+          | NEM_FEAT_F_FULL_GST_EXEC
+          | NEM_FEAT_F_XSAVE_XRSTOR;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ 
+@@ -1890,6 +1898,7 @@ VMM_INT_DECL(uint32_t) NEMHCGetFeatures(PVMCC pVM)
+ *********************************************************************************************************************************/
+ 
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(bool) NEMR3CanExecuteGuest(PVM pVM, PVMCPU pVCpu)
+ {
+ #ifndef VBOX_WITH_KVM_IRQCHIP_FULL
+@@ -1910,6 +1919,7 @@ VMMR3_INT_DECL(bool) NEMR3CanExecuteGuest(PVM pVM, PVMCPU pVCpu)
+     return true;
+ #endif
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ DECLHIDDEN(bool) nemR3NativeSetSingleInstruction(PVM pVM, PVMCPU pVCpu, bool fEnable)
+@@ -2635,6 +2645,7 @@ static VBOXSTRICTRC nemHCLnxCheckAndInjectInterrupts(PVMCPUCC pVCpu)
+ #endif
+ }
+ 
++#ifdef VBOX_WITH_NATIVE_NEM
+ VMMR3_INT_DECL(VBOXSTRICTRC) NEMR3RunGC(PVM pVM, PVMCPU pVCpu)
+ {
+     Assert(VM_IS_NEM_ENABLED(pVM));
+@@ -2940,6 +2951,7 @@ VMMR3_INT_DECL(VBOXSTRICTRC) NEMR3RunGC(PVM pVM, PVMCPU pVCpu)
+              pVCpu->cpum.GstCtx.rflags.u, VBOXSTRICTRC_VAL(rcStrict) ));
+     return rcStrict;
+ }
++#endif /* VBOX_WITH_NATIVE_NEM */
+ 
+ 
+ /** @page pg_nem_linux NEM/linux - Native Execution Manager, Linux.
+-- 
+2.54.0
+

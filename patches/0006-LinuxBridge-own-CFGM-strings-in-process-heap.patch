@@ -1,0 +1,122 @@
+From d32c5fd67332dd72c6ec8972736793d7108aa518 Mon Sep 17 00:00:00 2001
+From: virtualbox-kvm-automation <virtualbox-kvm@localhost>
+Date: Wed, 11 Nov 2026 14:43:05 +0800
+Subject: [PATCH] LinuxBridge: own CFGM strings in the process heap
+
+pszIfName/pszBridge/pszCtlPath could be freed with the wrong allocator:
+drvLinuxBridgeAttach() called RTStrFree() on the CFGM (MM-heap) IfName
+string when adopting a runtime interface name, and Destruct called
+PDMDrvHlpMMHeapFree() on strings that had been replaced with RTStrDup()
+copies (or defaulted to RTStrDup). Freeing an MM-heap pointer with libc
+free() poisons tcache/fastbin metadata: VM construction then died in
+malloc (SIGSEGV inside e1kR3Construct STAM registration), with
+glibc.malloc.tcache_count=0 it aborted with "double free or corruption
+(out)", and teardown aborted in munmap_chunk on the reverse mix.
+
+PDMDRVHLPR3 provides no MM-heap allocation callback, so runtime-created
+strings must live in the process heap. Take ownership of every CFGM
+query result once, right after reading it, by duplicating it with
+RTStrDup and releasing the MM-heap original; every later replacement
+(name adoption, default bridge name) and Destruct stays within
+RTStrDup/RTStrFree, keeping each field on a single allocator for its
+whole lifetime.
+---
+ src/VBox/Devices/Network/DrvLinuxBridge.cpp | 46 ++++++++++++++++++---
+ 1 file changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/src/VBox/Devices/Network/DrvLinuxBridge.cpp b/src/VBox/Devices/Network/DrvLinuxBridge.cpp
+index f6b22ec..0bf5646 100644
+--- a/src/VBox/Devices/Network/DrvLinuxBridge.cpp
++++ b/src/VBox/Devices/Network/DrvLinuxBridge.cpp
+@@ -834,11 +834,11 @@ static DECLCALLBACK(void) drvLinuxBridgeDestruct(PPDMDRVINS pDrvIns)
+         pThis->hFileDevice = NIL_RTFILE;
+     }
+ 
+-    PDMDrvHlpMMHeapFree(pDrvIns, pThis->pszIfName);
++    RTStrFree(pThis->pszIfName);
+     pThis->pszIfName = NULL;
+-    PDMDrvHlpMMHeapFree(pDrvIns, pThis->pszBridge);
++    RTStrFree(pThis->pszBridge);
+     pThis->pszBridge = NULL;
+-    PDMDrvHlpMMHeapFree(pDrvIns, pThis->pszCtlPath);
++    RTStrFree(pThis->pszCtlPath);
+     pThis->pszCtlPath = NULL;
+ 
+     if (RTCritSectIsInitialized(&pThis->XmitLock))
+@@ -892,6 +892,31 @@ static int drvLinuxBridgeQueryStringCI(PPDMDRVINS pDrvIns, PCFGMNODE pCfg, const
+     return pHlp->pfnCFGMQueryStringAlloc(pCfg, szActual, ppsz);
+ }
+ 
++/**
++ * Takes ownership of a CFGM string for the rest of the driver's lifetime.
++ *
++ * PDMDRVHLPR3 provides pfnMMHeapFree but no MM-heap allocation callback, so
++ * every string this driver owns beyond the initial query (adopted TAP names,
++ * the default bridge name) must live in the process heap, allocated with
++ * RTStrDup and released with RTStrFree.  This helper converts a CFGM
++ * (MM-heap) query result into a process-heap copy and releases the original,
++ * keeping each string field on a single allocator from construction to
++ * destruction.  Mixing the two allocators on one field corrupts the heap.
++ *
++ * @returns VBox status code (VERR_NO_MEMORY on allocation failure).
++ * @param   pDrvIns             Driver instance.
++ * @param   ppsz                Pointer to the CFGM-allocated string; replaced
++ *                              with a process-heap copy on success.
++ */
++static int drvLinuxBridgeOwnString(PPDMDRVINS pDrvIns, char **ppsz)
++{
++    char *psz = RTStrDup(*ppsz);
++    if (psz)
++        PDMDrvHlpMMHeapFree(pDrvIns, *ppsz);
++    *ppsz = psz;
++    return psz ? VINF_SUCCESS : VERR_NO_MEMORY;
++}
++
+ /**
+  * Construct a LinuxBridge network transport driver instance.
+  *
+@@ -988,6 +1013,8 @@ static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE p
+         if (pThis->pszBridge)
+             rc = VINF_SUCCESS;
+     }
++    else if (RT_SUCCESS(rc))
++        rc = drvLinuxBridgeOwnString(pDrvIns, &pThis->pszBridge);
+     if (RT_FAILURE(rc))
+         return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"Bridge\""));
+ 
+@@ -997,8 +1024,8 @@ static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE p
+        template) always wins. */
+     char szDefaultIfName[IFNAMSIZ];
+     RTStrCopy(szDefaultIfName, sizeof(szDefaultIfName), "vboxtap%d");
+-    /* Query by the actual stored key name (case-insensitive match), so that
+-       the CFGM allocator stays in charge of the MM-heap string. */
++    /* Query by the actual stored key name (case-insensitive match); ownership
++       of the value is taken right after validation below. */
+     char szIfNameKey[64];
+     if (drvLinuxBridgeFindKeyCI(pHlp, pCfg, "IfName", szIfNameKey, sizeof(szIfNameKey)) != VINF_SUCCESS)
+         strcpy(szIfNameKey, "IfName");
+@@ -1012,12 +1039,21 @@ static DECLCALLBACK(int) drvLinuxBridgeConstruct(PPDMDRVINS pDrvIns, PCFGMNODE p
+         return PDMDRV_SET_ERROR(pDrvIns, VERR_INVALID_NAME,
+                                 N_("Configuration error: \"IfName\" is too long (IFNAMSIZ-1 max)"));
+ 
++    /* The interface name is replaced at runtime (kernel-substituted "%d"
++       templates, helper-created interfaces), so take ownership of the CFGM
++       value right away; every later replacement stays within RTStrDup/RTStrFree. */
++    rc = drvLinuxBridgeOwnString(pDrvIns, &pThis->pszIfName);
++    if (RT_FAILURE(rc))
++        return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to own \"IfName\""));
++
+     rc = drvLinuxBridgeQueryStringCI(pDrvIns, pCfg, "CtlPath", &pThis->pszCtlPath);
+     if (rc == VERR_CFGM_VALUE_NOT_FOUND)
+     {
+         pThis->pszCtlPath = NULL;
+         rc = VINF_SUCCESS;
+     }
++    else if (RT_SUCCESS(rc))
++        rc = drvLinuxBridgeOwnString(pDrvIns, &pThis->pszCtlPath);
+     else if (RT_FAILURE(rc))
+         return PDMDRV_SET_ERROR(pDrvIns, rc, N_("Configuration error: failed to read \"CtlPath\""));
+ 
+-- 
+2.54.0
+
