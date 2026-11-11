@@ -39,13 +39,52 @@ virtualisation.virtualbox.host = {
 };
 ```
 
+
+### Arch Linux package (this fork)
+
+This fork adds a driverless network backend ("LinuxBridge": TAP + host bridge,
+no VirtualBox kernel modules) on top of the cyberus KVM patch, plus Arch
+packaging. `packaging/arch/PKGBUILD` defines the package version and source
+archive.
+```shell
+cd packaging/arch
+makepkg -s          # builds; installs makedepends via pacman
+package=$(makepkg --packagelist)
+sudo pacman -U "$package"
+
+The package conflicts with/provides `virtualbox`, installs to `/usr/lib/virtualbox`
+with `/usr/bin` entry points, a desktop entry, and the setuid `VBoxNetBrCtl`
+helper. After install:
+
+```shell
+sudo vboxbr0-setup                                     # host bridge + dnsmasq
+VBoxManage modifyvm <vm> --nic1 linuxbridge --nic-property1 bridge=vboxbr0
+```
+
+The repository-root `patches/` directory contains the canonical, numerically
+ordered patch series. `packaging/arch/*.patch` entries are relative symlinks
+into it because makepkg requires local sources next to the PKGBUILD.
+
+For development, use `scripts/init-source.sh` to create a Git-managed source
+tree from the verified official archive. Make topic commits there, export them
+with `scripts/export-patches.sh`, and validate the result with
+`scripts/roundtrip-patches.sh` before promoting staged patches.
+
+Maintaining / following upstream updates:
+
+1. Follow `.agents/skills/virtualbox-kvm/references/upgrade.md` to acquire and
+   verify official inputs, create a fresh baseline, and review semantic impact.
+2. Regenerate local topic patches from the source commits and update the
+   package sources and checksums from the resulting files.
+3. Run the round-trip check, rebuild with `makepkg -C -s`, and perform the
+   physical-host KVM smoke tests in the development skill.
+
 ![Enabling KVM backend for VirtualBox in NixOS](vbox-kvm-nixos.gif)
 
 ### Other distribution packages
 
-We don't provide any packaging for Linux distributions ourselves. However, there are some
-enthusiasts out there who create packages, e.g., for Debian and Arch. Keep an eye on our
-issue tracker for more details.
+For other distributions, use the manual build instructions below or check the
+issue tracker for third-party packaging.
 
 ### Manual Compilation
 
