@@ -40,6 +40,7 @@ source=(
   '0004-LinuxBridge-helper-and-host-integration.patch'
   '0005-LinuxBridge-attachment-type.patch'
   '0006-LinuxBridge-own-CFGM-strings-in-process-heap.patch'
+  '0007-NEM-add-PIC-state-restore-regression-tests.patch'
   'makeself.sh'
 )
 sha256sums=(
@@ -50,6 +51,7 @@ sha256sums=(
   '426692f025c8c3a585a2e18c92028681a0416de37bb8ef189ede074213321422'
   '772954adf81a34bb963b0f07cf1c0850eb419b5a09fa463563c4fec1ed558259'
   'a4686781c51166fe365d5fc52d4442826c4d4ff20595ecaa3bff2f73dbe3a15d'
+  '1b9ff7eb386c9bfdd3ff3b21e8cf7134ef43accd1d03c972ff2243fc44cf8d11'
   '2e73c14412b52124abfc832dd94c9178ff2567b1cce0fb502443d1d1965e2935'
 )
 
@@ -63,6 +65,7 @@ prepare() {
   patch -Np1 < "${srcdir}/0004-LinuxBridge-helper-and-host-integration.patch"
   patch -Np1 < "${srcdir}/0005-LinuxBridge-attachment-type.patch"
   patch -Np1 < "${srcdir}/0006-LinuxBridge-own-CFGM-strings-in-process-heap.patch"
+  patch -Np1 < "${srcdir}/0007-NEM-add-PIC-state-restore-regression-tests.patch"
 
   # configure requires a 'makeself' tool (only used for the .run installer we
   # never produce); the upstream release ships none in PATH, so provide one.

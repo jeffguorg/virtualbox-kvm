@@ -1,0 +1,439 @@
+From d67a202e9c11b9794c9ebc624a422d46fe6e24eb Mon Sep 17 00:00:00 2001
+From: guochao <jeffguorg@gmail.com>
+Date: Fri, 13 Nov 2026 10:51:06 +0800
+Subject: [PATCH 7/7] NEM: add PIC state restore regression tests
+
+Add a VMMStatic-based test that executes the production PIC setter with wrapped ioctls, plus an opt-in real-KVM layer using a private VM and irqchip without creating or running vCPUs.
+
+Both layers fail before the PIC GET/SET correction: the mock observes KVM_GET_IRQCHIP, and real-KVM readback retains the old interrupt mask. Forward the existing optional full-irqchip build define so production and tests use consistent declarations.
+---
+ Config.kmk                                  |   3 +
+ src/VBox/VMM/testcase/Makefile.kmk          |  17 +
+ src/VBox/VMM/testcase/tstNemKvmPicState.cpp | 366 ++++++++++++++++++++
+ 3 files changed, 386 insertions(+)
+ create mode 100644 src/VBox/VMM/testcase/tstNemKvmPicState.cpp
+
+diff --git a/Config.kmk b/Config.kmk
+index b1349a10..57dcd912 100644
+--- a/Config.kmk
++++ b/Config.kmk
+@@ -2111,6 +2111,9 @@ CYBERUS_CXX_FLAGS = -Werror -Wall
+ ifdef VBOX_WITH_KVM
+  DEFS += VBOX_WITH_KVM
+  DEFS += VBOX_WITH_KVM_NESTING
++ ifdef VBOX_WITH_KVM_IRQCHIP_FULL
++  DEFS += VBOX_WITH_KVM_IRQCHIP_FULL
++ endif
+ endif
+ ifndef VBOX_HEADLESS
+  DEFS += VBOX_WITH_GVT_RENDERING
+diff --git a/src/VBox/VMM/testcase/Makefile.kmk b/src/VBox/VMM/testcase/Makefile.kmk
+index 587894a3..c12a59a1 100644
+--- a/src/VBox/VMM/testcase/Makefile.kmk
++++ b/src/VBox/VMM/testcase/Makefile.kmk
+@@ -87,6 +87,9 @@ ifndef VBOX_ONLY_EXTPACKS_USE_IMPLIBS
+   	tstSSM \
+   	tstVMMUnitTests-1
+   PROGRAMS.amd64 += tstIEMAImplAsm
++  if defined(VBOX_WITH_KVM) && defined(VBOX_WITH_KVM_IRQCHIP_FULL) && "$(KBUILD_TARGET).$(KBUILD_TARGET_ARCH)" == "linux.amd64"
++   PROGRAMS += tstNemKvmPicState
++  endif
+   if defined(VBOX_WITH_IEM_NATIVE_RECOMPILER) && defined(VBOX_WITH_IEM_RECOMPILER)
+    PROGRAMS += tstIEMN8veProfiling
+   endif
+@@ -1078,6 +1081,20 @@ tstVMMUnitTests-1_LIBS      := \
+ tstVMMUnitTests-1_LDFLAGS.darwin.arm64 := -framework Hypervisor
+ 
+ 
++#
++# NEM KVM PIC state regression test.
++#
++tstNemKvmPicState_TEMPLATE := VBoxR3TstExe
++tstNemKvmPicState_DEFS     = IN_VMM_R3 VBOX_VMM_TARGET_X86 $(VMM_COMMON_DEFS)
++tstNemKvmPicState_INCS     = $(VBOX_PATH_VMM_SRC)/include
++tstNemKvmPicState_SOURCES  = tstNemKvmPicState.cpp
++tstNemKvmPicState_LIBS     = \
++	$(PATH_STAGE_LIB)/VMMStatic$(VBOX_SUFF_LIB) \
++	$(PATH_STAGE_LIB)/DisasmR3$(VBOX_SUFF_LIB) \
++	$(LIB_RUNTIME)
++tstNemKvmPicState_LDFLAGS.linux = -Wl,--wrap=ioctl
++
++
+ 
+ #
+ # ARMv8 PGM guest page table walking testcase.
+diff --git a/src/VBox/VMM/testcase/tstNemKvmPicState.cpp b/src/VBox/VMM/testcase/tstNemKvmPicState.cpp
+new file mode 100644
+index 00000000..2d1fc416
+--- /dev/null
++++ b/src/VBox/VMM/testcase/tstNemKvmPicState.cpp
+@@ -0,0 +1,366 @@
++/* $Id: tstNemKvmPicState.cpp $ */
++/** @file
++ * NEM KVM PIC state regression test.
++ */
++
++/*
++ * Copyright (C) 2025 Oracle and/or its affiliates.
++ *
++ * This file is part of VirtualBox base platform packages, as
++ * available from https://www.virtualbox.org.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation, in version 3 of the
++ * License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <https://www.gnu.org/licenses>.
++ *
++ * SPDX-License-Identifier: GPL-3.0-only
++ */
++
++
++/*********************************************************************************************************************************
++*   Header Files                                                                                                                 *
++*********************************************************************************************************************************/
++#include <VBox/vmm/nem.h>
++#include "NEMInternal.h"
++#include <VBox/vmm/vm.h>
++
++#include <iprt/errcore.h>
++#include <iprt/initterm.h>
++#include <iprt/mem.h>
++#include <iprt/message.h>
++#include <iprt/string.h>
++#include <iprt/test.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdarg.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <linux/kvm.h>
++
++
++/*********************************************************************************************************************************
++*   Global Variables                                                                                                             *
++*********************************************************************************************************************************/
++static RTTEST g_hTest;
++static bool g_fMockIoctl = false;
++static unsigned g_cMockIoctlCalls;
++static int g_fdMockIoctl;
++static unsigned long g_uMockIoctlRequest;
++static struct kvm_irqchip g_MockIrqChip;
++
++
++extern "C" int __real_ioctl(int fd, unsigned long request, ...);
++
++extern "C" int __wrap_ioctl(int fd, unsigned long request, ...)
++{
++    va_list Args;
++    va_start(Args, request);
++    void *pvArg = va_arg(Args, void *);
++    va_end(Args);
++
++    if (!g_fMockIoctl)
++        return __real_ioctl(fd, request, pvArg);
++
++    g_cMockIoctlCalls++;
++    g_fdMockIoctl = fd;
++    g_uMockIoctlRequest = request;
++    if (request == KVM_GET_IRQCHIP || request == KVM_SET_IRQCHIP)
++    {
++        g_MockIrqChip = *(struct kvm_irqchip *)pvArg;
++        return 0;
++    }
++
++    errno = ENOTTY;
++    return -1;
++}
++
++
++static KVMPICSTATE tstMakePicState(uint8_t bBase)
++{
++    KVMPICSTATE State;
++    State.last_irr                  = bBase + 0x01;
++    State.irr                       = bBase + 0x02;
++    State.imr                       = bBase + 0x03;
++    State.isr                       = bBase + 0x04;
++    State.priority_add              = bBase + 0x05;
++    State.irq_base                  = bBase + 0x06;
++    State.read_reg_select           = bBase + 0x07;
++    State.poll                      = bBase + 0x08;
++    State.special_mask              = bBase + 0x09;
++    State.init_state                = bBase + 0x0a;
++    State.auto_eoi                  = bBase + 0x0b;
++    State.rotate_on_auto_eoi        = bBase + 0x0c;
++    State.special_fully_nested_mode = bBase + 0x0d;
++    State.init4                     = bBase + 0x0e;
++    State.elcr                      = bBase + 0x0f;
++    State.elcr_mask                 = bBase + 0x10;
++    return State;
++}
++
++
++static void tstMockPic(KVMIRQCHIP enmIrqChip, uint32_t u32ChipId, uint8_t bBase, const char *pszName)
++{
++    RTTestSubF(g_hTest, "Mock %s", pszName);
++
++    g_cMockIoctlCalls = 0;
++    g_fdMockIoctl = -1;
++    g_uMockIoctlRequest = 0;
++    RT_ZERO(g_MockIrqChip);
++
++    PVM pVM = (PVM)RTMemAllocZ(sizeof(*pVM));
++    if (!pVM)
++    {
++        RTTestFailed(g_hTest, "Failed to allocate synthetic VM");
++        RTTestSubDone(g_hTest);
++        return;
++    }
++    pVM->nem.s.fdVm = 0x4b56;
++
++    KVMPICSTATE State = tstMakePicState(bBase);
++    g_fMockIoctl = true;
++    RTTEST_CHECK_RC(g_hTest, NEMR3KvmSetPicState(pVM, enmIrqChip, &State), VINF_SUCCESS);
++    g_fMockIoctl = false;
++
++    RTTEST_CHECK_MSG(g_hTest, g_cMockIoctlCalls == 1,
++                     (g_hTest, "ioctl call count: got %u, expected 1", g_cMockIoctlCalls));
++    RTTEST_CHECK_MSG(g_hTest, g_fdMockIoctl == pVM->nem.s.fdVm,
++                     (g_hTest, "ioctl fd: got %d, expected %d", g_fdMockIoctl, pVM->nem.s.fdVm));
++    RTTEST_CHECK_MSG(g_hTest, g_uMockIoctlRequest == KVM_SET_IRQCHIP,
++                     (g_hTest, "ioctl request: got %#lx, expected KVM_SET_IRQCHIP (%#lx)",
++                      g_uMockIoctlRequest, (unsigned long)KVM_SET_IRQCHIP));
++    if (g_uMockIoctlRequest == KVM_SET_IRQCHIP)
++    {
++        RTTEST_CHECK_MSG(g_hTest, g_MockIrqChip.chip_id == u32ChipId,
++                         (g_hTest, "chip ID: got %#x, expected %#x", g_MockIrqChip.chip_id, u32ChipId));
++
++#define TST_CHECK_MOCK_FIELD(a_Field) \
++        RTTEST_CHECK_MSG(g_hTest, g_MockIrqChip.chip.pic.a_Field == State.a_Field, \
++                         (g_hTest, "%s: got %#x, expected %#x", #a_Field, \
++                          (unsigned)g_MockIrqChip.chip.pic.a_Field, (unsigned)State.a_Field))
++        TST_CHECK_MOCK_FIELD(last_irr);
++        TST_CHECK_MOCK_FIELD(irr);
++        TST_CHECK_MOCK_FIELD(imr);
++        TST_CHECK_MOCK_FIELD(isr);
++        TST_CHECK_MOCK_FIELD(priority_add);
++        TST_CHECK_MOCK_FIELD(irq_base);
++        TST_CHECK_MOCK_FIELD(read_reg_select);
++        TST_CHECK_MOCK_FIELD(poll);
++        TST_CHECK_MOCK_FIELD(special_mask);
++        TST_CHECK_MOCK_FIELD(init_state);
++        TST_CHECK_MOCK_FIELD(auto_eoi);
++        TST_CHECK_MOCK_FIELD(rotate_on_auto_eoi);
++        TST_CHECK_MOCK_FIELD(special_fully_nested_mode);
++        TST_CHECK_MOCK_FIELD(init4);
++        TST_CHECK_MOCK_FIELD(elcr);
++        TST_CHECK_MOCK_FIELD(elcr_mask);
++#undef TST_CHECK_MOCK_FIELD
++    }
++
++    RTMemFree(pVM);
++    RTTestSubDone(g_hTest);
++}
++
++
++static void tstMock(void)
++{
++    tstMockPic(KVMIRQCHIP::PIC_MASTER, KVM_IRQCHIP_PIC_MASTER, 0x10, "PIC master");
++    tstMockPic(KVMIRQCHIP::PIC_SLAVE,  KVM_IRQCHIP_PIC_SLAVE,  0x80, "PIC slave");
++}
++
++
++struct RealKvmVm
++{
++    int fdKvm;
++    int fdVm;
++    PVM pVM;
++
++    RealKvmVm() : fdKvm(-1), fdVm(-1), pVM(NULL) { }
++
++    ~RealKvmVm()
++    {
++        RTMemFree(pVM);
++        if (fdVm >= 0)
++            close(fdVm);
++        if (fdKvm >= 0)
++            close(fdKvm);
++    }
++};
++
++
++static int tstRawGetPicState(int fdVm, uint32_t u32ChipId, struct kvm_irqchip *pState)
++{
++    RT_ZERO(*pState);
++    pState->chip_id = u32ChipId;
++    return __real_ioctl(fdVm, KVM_GET_IRQCHIP, pState);
++}
++
++
++static KVMPICSTATE tstPicStateFromRaw(const struct kvm_irqchip *pRaw)
++{
++    const struct kvm_pic_state *pPic = &pRaw->chip.pic;
++    KVMPICSTATE State = {};
++    State.last_irr                  = pPic->last_irr;
++    State.irr                       = pPic->irr;
++    State.imr                       = pPic->imr;
++    State.isr                       = pPic->isr;
++    State.priority_add              = pPic->priority_add;
++    State.irq_base                  = pPic->irq_base;
++    State.read_reg_select           = pPic->read_reg_select;
++    State.poll                      = pPic->poll;
++    State.special_mask              = pPic->special_mask;
++    State.init_state                = pPic->init_state;
++    State.auto_eoi                  = pPic->auto_eoi;
++    State.rotate_on_auto_eoi        = pPic->rotate_on_auto_eoi;
++    State.special_fully_nested_mode = pPic->special_fully_nested_mode;
++    State.init4                     = pPic->init4;
++    State.elcr                      = pPic->elcr;
++    State.elcr_mask                 = pPic->elcr_mask;
++    return State;
++}
++
++
++static void tstCheckRawPicState(const struct kvm_irqchip *pExpected, const struct kvm_irqchip *pActual)
++{
++    RTTEST_CHECK_MSG(g_hTest, pActual->chip_id == pExpected->chip_id,
++                     (g_hTest, "chip ID: got %#x, expected %#x", pActual->chip_id, pExpected->chip_id));
++
++#define TST_CHECK_RAW_FIELD(a_Field) \
++    RTTEST_CHECK_MSG(g_hTest, pActual->chip.pic.a_Field == pExpected->chip.pic.a_Field, \
++                     (g_hTest, "%s: got %#x, expected %#x", #a_Field, \
++                      (unsigned)pActual->chip.pic.a_Field, (unsigned)pExpected->chip.pic.a_Field))
++    TST_CHECK_RAW_FIELD(last_irr);
++    TST_CHECK_RAW_FIELD(irr);
++    TST_CHECK_RAW_FIELD(imr);
++    TST_CHECK_RAW_FIELD(isr);
++    TST_CHECK_RAW_FIELD(priority_add);
++    TST_CHECK_RAW_FIELD(irq_base);
++    TST_CHECK_RAW_FIELD(read_reg_select);
++    TST_CHECK_RAW_FIELD(poll);
++    TST_CHECK_RAW_FIELD(special_mask);
++    TST_CHECK_RAW_FIELD(init_state);
++    TST_CHECK_RAW_FIELD(auto_eoi);
++    TST_CHECK_RAW_FIELD(rotate_on_auto_eoi);
++    TST_CHECK_RAW_FIELD(special_fully_nested_mode);
++    TST_CHECK_RAW_FIELD(init4);
++    TST_CHECK_RAW_FIELD(elcr);
++    TST_CHECK_RAW_FIELD(elcr_mask);
++#undef TST_CHECK_RAW_FIELD
++}
++
++
++static void tstRealPic(PVM pVM, KVMIRQCHIP enmIrqChip, uint32_t u32ChipId, const char *pszName)
++{
++    RTTestSubF(g_hTest, "Real KVM %s", pszName);
++
++    struct kvm_irqchip Baseline;
++    if (tstRawGetPicState(pVM->nem.s.fdVm, u32ChipId, &Baseline) != 0)
++    {
++        int const iErr = errno;
++        RTTestFailed(g_hTest, "KVM_GET_IRQCHIP baseline for %s failed: %s", pszName, strerror(iErr));
++        RTTestSubDone(g_hTest);
++        return;
++    }
++
++    KVMPICSTATE State = tstPicStateFromRaw(&Baseline);
++    State.imr ^= 0x01;
++    struct kvm_irqchip Expected = Baseline;
++    Expected.chip.pic.imr = State.imr;
++
++    int rc = NEMR3KvmSetPicState(pVM, enmIrqChip, &State);
++    RTTEST_CHECK_RC(g_hTest, rc, VINF_SUCCESS);
++    if (RT_FAILURE(rc))
++    {
++        RTTestSubDone(g_hTest);
++        return;
++    }
++
++    struct kvm_irqchip Readback;
++    if (tstRawGetPicState(pVM->nem.s.fdVm, u32ChipId, &Readback) != 0)
++    {
++        int const iErr = errno;
++        RTTestFailed(g_hTest, "KVM_GET_IRQCHIP readback for %s failed: %s", pszName, strerror(iErr));
++        RTTestSubDone(g_hTest);
++        return;
++    }
++    tstCheckRawPicState(&Expected, &Readback);
++    RTTestSubDone(g_hTest);
++}
++
++
++static void tstRealKvm(void)
++{
++    RealKvmVm KvmVm;
++    KvmVm.fdKvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
++    if (KvmVm.fdKvm < 0)
++    {
++        int const iErr = errno;
++        RTTestFailed(g_hTest, "open(/dev/kvm) failed: %s", strerror(iErr));
++        return;
++    }
++
++    KvmVm.fdVm = __real_ioctl(KvmVm.fdKvm, KVM_CREATE_VM, 0);
++    if (KvmVm.fdVm < 0)
++    {
++        int const iErr = errno;
++        RTTestFailed(g_hTest, "KVM_CREATE_VM failed: %s", strerror(iErr));
++        return;
++    }
++
++    if (__real_ioctl(KvmVm.fdVm, KVM_CREATE_IRQCHIP, 0) != 0)
++    {
++        int const iErr = errno;
++        RTTestFailed(g_hTest, "KVM_CREATE_IRQCHIP failed: %s", strerror(iErr));
++        return;
++    }
++
++    KvmVm.pVM = (PVM)RTMemAllocZ(sizeof(*KvmVm.pVM));
++    if (!KvmVm.pVM)
++    {
++        RTTestFailed(g_hTest, "Failed to allocate synthetic VM");
++        return;
++    }
++    KvmVm.pVM->nem.s.fdVm = KvmVm.fdVm;
++
++    tstRealPic(KvmVm.pVM, KVMIRQCHIP::PIC_MASTER, KVM_IRQCHIP_PIC_MASTER, "PIC master");
++    tstRealPic(KvmVm.pVM, KVMIRQCHIP::PIC_SLAVE,  KVM_IRQCHIP_PIC_SLAVE,  "PIC slave");
++}
++
++
++int main(int argc, char **argv)
++{
++    int rc = RTR3InitExe(argc, &argv, SUPR3INIT_F_DRIVERLESS << RTR3INIT_FLAGS_SUPLIB_SHIFT);
++    if (RT_FAILURE(rc))
++        return RTMsgInitFailure(rc);
++
++    bool fRealKvm = false;
++    if (argc == 2 && RTStrCmp(argv[1], "--real-kvm") == 0)
++        fRealKvm = true;
++    else if (argc != 1)
++        return RTMsgErrorExitFailure("Unknown argument or invalid argument count; usage: %s [--real-kvm]", argv[0]);
++
++    rc = RTTestCreate("tstNemKvmPicState", &g_hTest);
++    if (RT_FAILURE(rc))
++        return RTMsgErrorExitFailure("RTTestCreate failed: %Rrc", rc);
++    RTTestBanner(g_hTest);
++
++    if (fRealKvm)
++    {
++        g_fMockIoctl = false;
++        tstRealKvm();
++    }
++    else
++        tstMock();
++
++    return RTTestSummaryAndDestroy(g_hTest);
++}
+-- 
+2.54.0
+
