@@ -1,0 +1,31 @@
+From 5a15ba3e1701684d8a1e3496993fa67728623427 Mon Sep 17 00:00:00 2001
+From: guochao <jeffguorg@gmail.com>
+Date: Fri, 13 Nov 2026 13:32:54 +0800
+Subject: [PATCH 8/8] NEM: restore PIC state with KVM_SET_IRQCHIP
+
+NEMR3KvmSetPicState constructed the restored PIC payload but issued KVM_GET_IRQCHIP, which only read the current kernel state back into a local buffer. Use KVM_SET_IRQCHIP so full-irqchip saved-state loads actually restore the master and slave PICs, and correct the failure diagnostic.
+
+The new mocked-ioctl and private-VM real-KVM regression tests both failed before this change and pass afterward.
+---
+ src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp b/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp
+index 3465d736..6ecbb7d7 100644
+--- a/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp
++++ b/src/VBox/VMM/VMMR3/target-x86/NEMR3Native-linux-x86.cpp
+@@ -903,9 +903,9 @@ VMMR3_INT_DECL(int) NEMR3KvmSetPicState(PVM pVM, KVMIRQCHIP irqchip, KVMPICSTATE
+     irqchip_state.chip.pic.elcr = state->elcr;
+     irqchip_state.chip.pic.elcr_mask = state->elcr_mask;
+ 
+-    int rcLnx = ioctl(pVM->nem.s.fdVm, KVM_GET_IRQCHIP, &irqchip_state);
++    int rcLnx = ioctl(pVM->nem.s.fdVm, KVM_SET_IRQCHIP, &irqchip_state);
+     AssertLogRelMsgReturn(rcLnx == 0, ("NEMR3KvmSetPicState: \
+-                Failed to get PIC state. Error: %d, errno %d\n", rcLnx, errno), VERR_NEM_IPE_5);
++                Failed to set PIC state. Error: %d, errno %d\n", rcLnx, errno), VERR_NEM_IPE_5);
+ 
+     return VINF_SUCCESS;
+ }
+-- 
+2.54.0
+

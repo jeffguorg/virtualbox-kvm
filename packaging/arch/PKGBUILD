@@ -10,7 +10,7 @@
 # make those patches available as makepkg sources in the ordered series below.
 pkgname=virtualbox-kvm-jeffguorg-patched
 pkgver=7.2.22
-pkgrel=1
+pkgrel=2
 pkgdesc='VirtualBox with KVM backend and LinuxBridge host networking (driverless, no kernel modules)'
 arch=('x86_64')
 # Arch debug-package convention: makepkg strips binaries as usual and splits
@@ -41,6 +41,7 @@ source=(
   '0005-LinuxBridge-attachment-type.patch'
   '0006-LinuxBridge-own-CFGM-strings-in-process-heap.patch'
   '0007-NEM-add-PIC-state-restore-regression-tests.patch'
+  '0008-NEM-restore-PIC-state-with-KVM_SET_IRQCHIP.patch'
   'makeself.sh'
 )
 sha256sums=(
@@ -52,6 +53,7 @@ sha256sums=(
   '772954adf81a34bb963b0f07cf1c0850eb419b5a09fa463563c4fec1ed558259'
   'a4686781c51166fe365d5fc52d4442826c4d4ff20595ecaa3bff2f73dbe3a15d'
   '1b9ff7eb386c9bfdd3ff3b21e8cf7134ef43accd1d03c972ff2243fc44cf8d11'
+  'a22f53e8dcc4ca12fbd447d1b5467afc6857caaa8ae18596344561f552070f32'
   '2e73c14412b52124abfc832dd94c9178ff2567b1cce0fb502443d1d1965e2935'
 )
 
@@ -66,6 +68,7 @@ prepare() {
   patch -Np1 < "${srcdir}/0005-LinuxBridge-attachment-type.patch"
   patch -Np1 < "${srcdir}/0006-LinuxBridge-own-CFGM-strings-in-process-heap.patch"
   patch -Np1 < "${srcdir}/0007-NEM-add-PIC-state-restore-regression-tests.patch"
+  patch -Np1 < "${srcdir}/0008-NEM-restore-PIC-state-with-KVM_SET_IRQCHIP.patch"
 
   # configure requires a 'makeself' tool (only used for the .run installer we
   # never produce); the upstream release ships none in PATH, so provide one.

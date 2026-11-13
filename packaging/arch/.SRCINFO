@@ -1,7 +1,7 @@
 pkgbase = virtualbox-kvm-jeffguorg-patched
 	pkgdesc = VirtualBox with KVM backend and LinuxBridge host networking (driverless, no kernel modules)
 	pkgver = 7.2.22
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/jeffguorg/virtualbox-kvm
 	install = virtualbox-kvm-jeffguorg-patched.install
 	arch = x86_64
@@ -46,6 +46,7 @@ pkgbase = virtualbox-kvm-jeffguorg-patched
 	source = 0005-LinuxBridge-attachment-type.patch
 	source = 0006-LinuxBridge-own-CFGM-strings-in-process-heap.patch
 	source = 0007-NEM-add-PIC-state-restore-regression-tests.patch
+	source = 0008-NEM-restore-PIC-state-with-KVM_SET_IRQCHIP.patch
 	source = makeself.sh
 	sha256sums = 440a2b3eeb46e7e992961b70ef24f43e95b3c99fa2ab30aac20b963ef9e91ad7
 	sha256sums = 96956ccc1374d542adee6047b8e43b37fe07472be6637fd3258ad6f218621456
@@ -55,6 +56,7 @@ pkgbase = virtualbox-kvm-jeffguorg-patched
 	sha256sums = 772954adf81a34bb963b0f07cf1c0850eb419b5a09fa463563c4fec1ed558259
 	sha256sums = a4686781c51166fe365d5fc52d4442826c4d4ff20595ecaa3bff2f73dbe3a15d
 	sha256sums = 1b9ff7eb386c9bfdd3ff3b21e8cf7134ef43accd1d03c972ff2243fc44cf8d11
+	sha256sums = a22f53e8dcc4ca12fbd447d1b5467afc6857caaa8ae18596344561f552070f32
 	sha256sums = 2e73c14412b52124abfc832dd94c9178ff2567b1cce0fb502443d1d1965e2935
 
 pkgname = virtualbox-kvm-jeffguorg-patched
